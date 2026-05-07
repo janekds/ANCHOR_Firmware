@@ -55,6 +55,12 @@
 #define AP_SSID   "AnchorX-Setup"
 #define DNS_PORT  53
 
+// UART (connects to main controller after skip)
+// Adjust TX/RX to whichever free GPIOs your board has wired
+#define UART_TX  1
+#define UART_RX  2
+#define UART_BAUD 115200
+
 // ── Palette (light theme — black text for maximum contrast) ──
 #define C_BG      0xF4F6F8   // off-white screen background
 #define C_CARD    0xFFFFFF   // pure white card
@@ -91,6 +97,23 @@ static lv_obj_t *lbl_wifi_ip      = NULL;
 // Dynamic value labels for sliders
 static lv_obj_t *lbl_brightness_val = NULL;
 static lv_obj_t *lbl_flow_val       = NULL;
+
+// Handles held so btn_skip_cb can show/hide them
+static lv_obj_t *card_brightness = NULL;   // brightness slider card
+static lv_obj_t *card_flow       = NULL;   // flow slider card
+static lv_obj_t *card_chips      = NULL;   // status chip row
+static lv_obj_t *btn_bar         = NULL;   // bottom button bar
+static lv_obj_t *card_uart       = NULL;   // UART data card (hidden until skip)
+
+// Labels inside the UART data card
+static lv_obj_t *lbl_uuid = NULL;
+static lv_obj_t *lbl_temp = NULL;
+static lv_obj_t *lbl_ato  = NULL;
+
+// UART state
+static bool   uart_mode = false;
+static char   uart_buf[128];
+static uint8_t uart_idx  = 0;
 
 // ── WiFi / portal globals ─────────────────────────────────────
 WebServer   webServer(80);
@@ -445,30 +468,23 @@ static void btn_back_cb(lv_event_t *) {
 }
 
 static void btn_skip_cb(lv_event_t *) {
-    lv_obj_t *toast = lv_label_create(scr_welcome);
-    lv_label_set_text(toast, "  WiFi skipped — connect later  ");
-    lv_obj_set_style_bg_color(toast, lv_color_hex(0x1A2A3A), 0);
-    lv_obj_set_style_bg_opa(toast, LV_OPA_COVER, 0);
-    lv_obj_set_style_text_color(toast, lv_color_hex(C_GREY), 0);
-    lv_obj_set_style_text_opa(toast, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(toast, 10, 0);
-    lv_obj_set_style_pad_hor(toast, 10, 0);
-    lv_obj_set_style_pad_ver(toast, 6, 0);
-    lv_obj_add_flag(toast, static_cast<lv_obj_flag_t>(
-        LV_OBJ_FLAG_IGNORE_LAYOUT | LV_OBJ_FLAG_FLOATING));
-    lv_obj_align(toast, LV_ALIGN_BOTTOM_MID, 0, -90);
-    lv_anim_t a; lv_anim_init(&a);
-    lv_anim_set_var(&a, toast);
-    lv_anim_set_exec_cb(&a, [](void *o, int32_t v) {
-        lv_obj_set_style_opa(static_cast<lv_obj_t*>(o), (lv_opa_t)v, 0);
-    });
-    lv_anim_set_values(&a, LV_OPA_COVER, LV_OPA_TRANSP);
-    lv_anim_set_duration(&a, 400);
-    lv_anim_set_delay(&a, 2000);
-    lv_anim_set_deleted_cb(&a, [](lv_anim_t *an) {
-        lv_obj_delete(static_cast<lv_obj_t*>(an->var));
-    });
-    lv_anim_start(&a);
+    if (uart_mode) return; // already activated
+
+    // ── Hide setup-only UI ──
+    lv_obj_add_flag(btn_bar,         LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(card_brightness, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(card_flow,       LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(card_chips,      LV_OBJ_FLAG_HIDDEN);
+
+    // ── Reveal the live-data card ──
+    lv_obj_clear_flag(card_uart, LV_OBJ_FLAG_HIDDEN);
+
+    // ── Start UART ──
+    Serial2.begin(UART_BAUD, SERIAL_8N1, UART_RX, UART_TX);
+    uart_mode  = true;
+    uart_idx   = 0;
+
+    Serial.println("[UART] mode active — listening on Serial2");
 }
 
 // ═════════════════════════════════════════════════════════════
@@ -590,8 +606,9 @@ static void create_welcome_screen() {
     lv_obj_clear_flag(cont, LV_OBJ_FLAG_SCROLL_ELASTIC);
 
     // ── Brightness slider card ──
+    card_brightness = make_card(cont, C_CARD, C_BORDER, 0, 10);
     {
-        lv_obj_t *card = make_card(cont, C_CARD, C_BORDER, 0, 10);
+        lv_obj_t *card = card_brightness;
         lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
         lv_obj_set_style_pad_row(card, 6, 0);
 
@@ -603,8 +620,9 @@ static void create_welcome_screen() {
     }
 
     // ── Flow rate slider card ──
+    card_flow = make_card(cont, C_CARD, C_BORDER, 0, 10);
     {
-        lv_obj_t *card = make_card(cont, C_CARD, C_BORDER, 0, 10);
+        lv_obj_t *card = card_flow;
         lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
         lv_obj_set_style_pad_row(card, 6, 0);
 
@@ -615,9 +633,40 @@ static void create_welcome_screen() {
         make_slider(card, C_BORDER, C_ACCENT, 0, 500, 200, slider_flow_cb);
     }
 
+    // ── UART connected data card (hidden until Skip is pressed) ──
+    card_uart = make_card(cont, C_CARD, C_BORDER, 1, 10);
+    lv_obj_add_flag(card_uart, LV_OBJ_FLAG_HIDDEN);
+    {
+        lv_obj_t *card = card_uart;
+        lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_row(card, 10, 0);
+
+        // UUID row
+        lv_obj_t *r1 = make_row(card, C_CARD);
+        add_label(r1, LV_SYMBOL_SETTINGS "  Device UUID", C_GREY, &lv_font_montserrat_10);
+        lbl_uuid = add_label(r1, "—", C_BLACK, &lv_font_montserrat_10);
+
+        // Divider
+        lv_obj_t *div = lv_obj_create(card);
+        lv_obj_set_size(div, LV_PCT(100), 1);
+        solid_bg(div, C_BORDER);
+        lv_obj_set_style_border_width(div, 0, 0);
+
+        // Temperature row
+        lv_obj_t *r2 = make_row(card, C_CARD);
+        add_label(r2, LV_SYMBOL_CHARGE "  Temperature", C_BLACK);
+        lbl_temp = add_label(r2, "— °F", C_BLACK);
+
+        // ATO status row
+        lv_obj_t *r3 = make_row(card, C_CARD);
+        add_label(r3, LV_SYMBOL_TINT "  ATO Status", C_BLACK);
+        lbl_ato = add_label(r3, "—", C_BLACK);
+    }
+
     // ── Status chips ──
     {
-        lv_obj_t *row = lv_obj_create(cont);
+        card_chips = lv_obj_create(cont);
+        lv_obj_t *row = card_chips;
         lv_obj_set_size(row, LV_PCT(100), LV_SIZE_CONTENT);
         solid_bg(row, C_BG);
         lv_obj_set_style_border_width(row, 0, 0);
@@ -662,7 +711,8 @@ static void create_welcome_screen() {
     }
 
     // ── Bottom bar ──
-    lv_obj_t *bar = lv_obj_create(scr_welcome);
+    btn_bar = lv_obj_create(scr_welcome);
+    lv_obj_t *bar = btn_bar;
     lv_obj_set_size(bar, SCREEN_W, 80);
     lv_obj_align(bar, LV_ALIGN_BOTTOM_MID, 0, 0);
     solid_bg(bar, C_WHITE);
@@ -881,6 +931,54 @@ void loop() {
     if (captivePortalActive) {
         dnsServer.processNextRequest();
         webServer.handleClient();
+    }
+
+    // ── UART receive & display ──
+    // Expected line format (newline-terminated):
+    //   UUID:XXXXXXXX,TEMP:78.4,ATO:ON
+    // Any field can be omitted; unrecognised fields are ignored.
+    if (uart_mode) {
+        while (Serial2.available()) {
+            char c = (char)Serial2.read();
+            if (c == '\n' || c == '\r') {
+                if (uart_idx == 0) continue;   // skip blank lines
+                uart_buf[uart_idx] = '\0';
+                uart_idx = 0;
+
+                // UUID
+                char *p = strstr(uart_buf, "UUID:");
+                if (p && lbl_uuid) {
+                    char val[48] = "—";
+                    sscanf(p + 5, "%47[^,\r\n]", val);
+                    lv_label_set_text(lbl_uuid, val);
+                }
+                // TEMP
+                p = strstr(uart_buf, "TEMP:");
+                if (p && lbl_temp) {
+                    char raw[16] = "";
+                    sscanf(p + 5, "%15[^,\r\n]", raw);
+                    char fmt[24];
+                    snprintf(fmt, sizeof(fmt), "%s °F", raw);
+                    lv_label_set_text(lbl_temp, fmt);
+                }
+                // ATO
+                p = strstr(uart_buf, "ATO:");
+                if (p && lbl_ato) {
+                    char val[16] = "—";
+                    sscanf(p + 4, "%15[^,\r\n]", val);
+                    // Colour the ATO label green/orange based on state
+                    bool active = (strncmp(val, "ON", 2) == 0 ||
+                                   strncmp(val, "on", 2) == 0);
+                    lv_obj_set_style_text_color(
+                        lbl_ato,
+                        lv_color_hex(active ? C_GREEN : C_ORANGE), 0);
+                    lv_label_set_text(lbl_ato, val);
+                }
+            } else {
+                if (uart_idx < sizeof(uart_buf) - 1)
+                    uart_buf[uart_idx++] = c;
+            }
+        }
     }
 
     delay(5);
