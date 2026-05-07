@@ -218,6 +218,7 @@ static lv_obj_t *make_card(lv_obj_t *parent, int w, uint32_t bg_color,
     lv_obj_t *card = lv_obj_create(parent);
     lv_obj_set_size(card, w, LV_SIZE_CONTENT);
     lv_obj_set_style_bg_color(card, lv_color_hex(bg_color), 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
     lv_obj_set_style_border_color(card, lv_color_hex(border_color), 0);
     lv_obj_set_style_border_width(card, border_w, 0);
     lv_obj_set_style_radius(card, radius, 0);
@@ -449,6 +450,7 @@ static void create_welcome_screen() {
 static void create_wifi_screen() {
     scr_wifi = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(scr_wifi, lv_color_hex(C_BG_PANEL), 0);
+    lv_obj_set_style_bg_opa(scr_wifi, LV_OPA_COVER, 0);
     lv_obj_clear_flag(scr_wifi, LV_OBJ_FLAG_SCROLLABLE);
 
     // ── Header ───────────────────────────────────────────────
@@ -456,6 +458,7 @@ static void create_wifi_screen() {
     lv_obj_set_size(hdr, SCREEN_W, 54);
     lv_obj_align(hdr, LV_ALIGN_TOP_MID, 0, 0);
     lv_obj_set_style_bg_color(hdr, lv_color_hex(C_HDR), 0);
+    lv_obj_set_style_bg_opa(hdr, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(hdr, 0, 0);
     lv_obj_set_style_radius(hdr, 0, 0);
     lv_obj_clear_flag(hdr, LV_OBJ_FLAG_SCROLLABLE);
@@ -475,7 +478,8 @@ static void create_wifi_screen() {
 
     lv_obj_t *lbl_hdr = lv_label_create(hdr);
     lv_label_set_text(lbl_hdr, LV_SYMBOL_WIFI "  WiFi Setup");
-    lv_obj_set_style_text_color(lbl_hdr, lv_color_hex(C_TEXT), 0);
+    lv_obj_set_style_text_color(lbl_hdr, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_opa(lbl_hdr, LV_OPA_COVER, 0);
     lv_obj_set_style_text_font(lbl_hdr, &lv_font_montserrat_16, 0);
     lv_obj_align(lbl_hdr, LV_ALIGN_CENTER, 12, 0);
 
@@ -484,6 +488,7 @@ static void create_wifi_screen() {
     lv_obj_set_size(pane, SCREEN_W, SCREEN_H - 54);
     lv_obj_align(pane, LV_ALIGN_TOP_MID, 0, 54);
     lv_obj_set_style_bg_color(pane, lv_color_hex(C_BG_PANEL), 0);
+    lv_obj_set_style_bg_opa(pane, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(pane, 0, 0);
     lv_obj_set_style_radius(pane, 0, 0);
     lv_obj_set_style_pad_hor(pane, 14, 0);
@@ -500,6 +505,7 @@ static void create_wifi_screen() {
     lv_obj_t *hero = lv_obj_create(pane);
     lv_obj_set_size(hero, LV_PCT(100), LV_SIZE_CONTENT);
     lv_obj_set_style_bg_color(hero, lv_color_hex(0x0D2137), 0);
+    lv_obj_set_style_bg_opa(hero, LV_OPA_COVER, 0);
     lv_obj_set_style_border_color(hero, lv_color_hex(C_BLUE), 0);
     lv_obj_set_style_border_width(hero, 2, 0);
     lv_obj_set_style_radius(hero, 14, 0);
@@ -514,25 +520,36 @@ static void create_wifi_screen() {
     lv_label_set_text(phone_icon, LV_SYMBOL_CALL);
     lv_obj_set_style_text_font(phone_icon, &lv_font_montserrat_24, 0);
     lv_obj_set_style_text_color(phone_icon, lv_color_hex(C_ACCENT), 0);
+    lv_obj_set_style_text_opa(phone_icon, LV_OPA_COVER, 0);
 
     lv_obj_t *main_lbl = lv_label_create(hero);
     lv_label_set_text(main_lbl, "Open your phone");
     lv_obj_set_style_text_font(main_lbl, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(main_lbl, lv_color_hex(C_TEXT), 0);
+    lv_obj_set_style_text_color(main_lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_opa(main_lbl, LV_OPA_COVER, 0);
 
     lv_obj_t *sub_lbl = lv_label_create(hero);
     lv_label_set_text(sub_lbl,
         "Follow the steps below to\n"
         "connect AnchorX to your\n"
         "home WiFi network.");
-    lv_obj_set_style_text_color(sub_lbl, lv_color_hex(C_TEXT_MUTE), 0);
+    lv_obj_set_style_text_color(sub_lbl, lv_color_hex(0xA0B4C8), 0);
+    lv_obj_set_style_text_opa(sub_lbl, LV_OPA_COVER, 0);
     lv_obj_set_style_text_align(sub_lbl, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_width(sub_lbl, LV_PCT(100));
 
-    // ── Section label ─────────────────────────────────────────
-    lv_obj_t *sec_lbl = lv_label_create(pane);
+    // ── Section label — needs an opaque container of its own ──
+    lv_obj_t *sec_cont = lv_obj_create(pane);
+    lv_obj_set_size(sec_cont, LV_PCT(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(sec_cont, lv_color_hex(C_BG_PANEL), 0);
+    lv_obj_set_style_bg_opa(sec_cont, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(sec_cont, 0, 0);
+    lv_obj_set_style_pad_all(sec_cont, 2, 0);
+    lv_obj_clear_flag(sec_cont, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *sec_lbl = lv_label_create(sec_cont);
     lv_label_set_text(sec_lbl, "SETUP STEPS");
-    lv_obj_set_style_text_color(sec_lbl, lv_color_hex(C_TEXT_MUTE), 0);
+    lv_obj_set_style_text_color(sec_lbl, lv_color_hex(0x7A9AB8), 0);
+    lv_obj_set_style_text_opa(sec_lbl, LV_OPA_COVER, 0);
     lv_obj_set_style_text_font(sec_lbl, &lv_font_montserrat_10, 0);
 
     // ── Step cards ────────────────────────────────────────────
@@ -568,6 +585,7 @@ static void create_wifi_screen() {
         lv_obj_t *card = lv_obj_create(pane);
         lv_obj_set_size(card, LV_PCT(100), LV_SIZE_CONTENT);
         lv_obj_set_style_bg_color(card, lv_color_hex(0x0D2137), 0);
+        lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
         lv_obj_set_style_border_color(card, lv_color_hex(steps[i].accent), 0);
         lv_obj_set_style_border_width(card, 3, 0);
         lv_obj_set_style_border_side(card, LV_BORDER_SIDE_LEFT, 0);
@@ -583,6 +601,7 @@ static void create_wifi_screen() {
         lv_obj_t *badge = lv_obj_create(card);
         lv_obj_set_size(badge, 28, 28);
         lv_obj_set_style_bg_color(badge, lv_color_hex(steps[i].accent), 0);
+        lv_obj_set_style_bg_opa(badge, LV_OPA_COVER, 0);
         lv_obj_set_style_border_width(badge, 0, 0);
         lv_obj_set_style_radius(badge, 14, 0);
         lv_obj_set_style_pad_all(badge, 0, 0);
@@ -591,13 +610,15 @@ static void create_wifi_screen() {
         snprintf(num, sizeof(num), "%d", i + 1);
         lv_obj_t *num_lbl = lv_label_create(badge);
         lv_label_set_text(num_lbl, num);
-        lv_obj_set_style_text_color(num_lbl, lv_color_hex(C_TEXT), 0);
+        lv_obj_set_style_text_color(num_lbl, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_text_opa(num_lbl, LV_OPA_COVER, 0);
         lv_obj_center(num_lbl);
 
-        // Step text
+        // Step text — pure white for maximum contrast on dark card
         lv_obj_t *txt = lv_label_create(card);
         lv_label_set_text(txt, steps[i].text);
-        lv_obj_set_style_text_color(txt, lv_color_hex(C_TEXT_STEP), 0);
+        lv_obj_set_style_text_color(txt, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_text_opa(txt, LV_OPA_COVER, 0);
         lv_obj_set_width(txt, SCREEN_W - 14*2 - 28 - 10 - 10);
         lv_obj_set_style_text_font(txt, &lv_font_montserrat_14, 0);
     }
