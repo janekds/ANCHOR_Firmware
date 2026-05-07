@@ -479,7 +479,7 @@ static void btn_back_cb(lv_event_t *) {
 }
 
 // Forward declarations
-static void startCaptivePortal();
+void startCaptivePortal();
 
 // ─────────────────────────────────────────────────────────────
 // Shared data-line parser — called from both Serial2 and USB Serial
