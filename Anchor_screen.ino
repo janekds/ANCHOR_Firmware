@@ -24,6 +24,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <SPI.h>
+#include <time.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
 #include <lvgl.h>
@@ -111,9 +112,19 @@ static lv_obj_t *lbl_temp = NULL;
 static lv_obj_t *lbl_ato  = NULL;
 
 // UART state
-static bool   uart_mode = false;
-static char   uart_buf[128];
+static bool    uart_mode = false;
+static char    uart_buf[128];
 static uint8_t uart_idx  = 0;
+
+// USB-Serial (Arduino Serial Monitor) receive buffer
+static char    usb_buf[128];
+static uint8_t usb_idx = 0;
+
+// Settings screen
+static lv_obj_t   *scr_settings      = NULL;
+static lv_obj_t   *lbl_settings_time = NULL;
+static lv_obj_t   *lbl_settings_date = NULL;
+static lv_timer_t *timer_clock        = NULL;
 
 // ── WiFi / portal globals ─────────────────────────────────────
 WebServer   webServer(80);
@@ -467,6 +478,85 @@ static void btn_back_cb(lv_event_t *) {
     lv_scr_load_anim(scr_welcome, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 250, 0, false);
 }
 
+// Forward declarations
+static void startCaptivePortal();
+
+// ─────────────────────────────────────────────────────────────
+// Shared data-line parser — called from both Serial2 and USB Serial
+// Frame format (newline-terminated, any subset of keys):
+//   UUID:ANCHOR-A3F2,TEMP:78.4,ATO:ON
+//   SETTIME:2026-05-07T15:43:00
+// ─────────────────────────────────────────────────────────────
+static void parse_data_line(const char *line) {
+    const char *p;
+
+    // UUID
+    p = strstr(line, "UUID:");
+    if (p && lbl_uuid) {
+        char val[48] = "—";
+        sscanf(p + 5, "%47[^,\r\n]", val);
+        lv_label_set_text(lbl_uuid, val);
+    }
+    // TEMP
+    p = strstr(line, "TEMP:");
+    if (p && lbl_temp) {
+        char raw[16] = "";
+        sscanf(p + 5, "%15[^,\r\n]", raw);
+        char fmt[28];
+        snprintf(fmt, sizeof(fmt), "%s \xc2\xb0" "F", raw);   // °F in UTF-8
+        lv_label_set_text(lbl_temp, fmt);
+    }
+    // ATO
+    p = strstr(line, "ATO:");
+    if (p && lbl_ato) {
+        char val[16] = "—";
+        sscanf(p + 4, "%15[^,\r\n]", val);
+        bool active = (strncasecmp(val, "ON", 2) == 0);
+        lv_obj_set_style_text_color(lbl_ato,
+            lv_color_hex(active ? C_GREEN : C_ORANGE), 0);
+        lv_label_set_text(lbl_ato, val);
+    }
+    // SETTIME:YYYY-MM-DDTHH:MM:SS
+    p = strstr(line, "SETTIME:");
+    if (p) {
+        struct tm t = {};
+        if (sscanf(p + 8, "%d-%d-%dT%d:%d:%d",
+                   &t.tm_year, &t.tm_mon, &t.tm_mday,
+                   &t.tm_hour, &t.tm_min, &t.tm_sec) == 6) {
+            t.tm_year -= 1900;
+            t.tm_mon  -= 1;
+            time_t epoch = mktime(&t);
+            struct timeval tv = { epoch, 0 };
+            settimeofday(&tv, NULL);
+            Serial.printf("[TIME] Set to %04d-%02d-%02d %02d:%02d:%02d\n",
+                          t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+                          t.tm_hour, t.tm_min, t.tm_sec);
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Clock timer — fires every 1 s, updates the settings screen labels
+// ─────────────────────────────────────────────────────────────
+static void clock_timer_cb(lv_timer_t *) {
+    if (!lbl_settings_time || !lbl_settings_date) return;
+    time_t now; struct tm ti;
+    time(&now);
+    localtime_r(&now, &ti);
+    char tbuf[12], dbuf[20];
+    strftime(tbuf, sizeof(tbuf), "%H:%M:%S", &ti);
+    strftime(dbuf, sizeof(dbuf), "%a  %d %b %Y", &ti);
+    lv_label_set_text(lbl_settings_time, tbuf);
+    lv_label_set_text(lbl_settings_date, dbuf);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Settings navigation
+// ─────────────────────────────────────────────────────────────
+static void btn_settings_cb(lv_event_t *) {
+    lv_scr_load_anim(scr_settings, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+}
+
 static void btn_skip_cb(lv_event_t *) {
     if (uart_mode) return; // already activated
 
@@ -568,6 +658,102 @@ static lv_obj_t *make_slider(lv_obj_t *parent,
 }
 
 // ═════════════════════════════════════════════════════════════
+// Settings screen
+// ═════════════════════════════════════════════════════════════
+static void create_settings_screen() {
+    scr_settings = lv_obj_create(NULL);
+    solid_bg(scr_settings, C_BG);
+    lv_obj_clear_flag(scr_settings, LV_OBJ_FLAG_SCROLLABLE);
+
+    // ── Header ──
+    lv_obj_t *hdr = lv_obj_create(scr_settings);
+    lv_obj_set_size(hdr, SCREEN_W, 50);
+    lv_obj_align(hdr, LV_ALIGN_TOP_MID, 0, 0);
+    solid_bg(hdr, C_HDR);
+    lv_obj_set_style_border_width(hdr, 0, 0);
+    lv_obj_set_style_radius(hdr, 0, 0);
+    lv_obj_set_style_pad_all(hdr, 0, 0);
+    lv_obj_clear_flag(hdr, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *back = lv_button_create(hdr);
+    lv_obj_set_size(back, 38, 34);
+    lv_obj_align(back, LV_ALIGN_LEFT_MID, 8, 0);
+    solid_bg(back, 0x1976D2);
+    lv_obj_set_style_radius(back, 8, 0);
+    lv_obj_set_style_shadow_width(back, 0, 0);
+    lv_obj_add_event_cb(back, [](lv_event_t *) {
+        lv_scr_load_anim(scr_welcome, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 250, 0, false);
+    }, LV_EVENT_CLICKED, NULL);
+    lv_obj_center(add_label(back, LV_SYMBOL_LEFT, C_WHITE, &lv_font_montserrat_14));
+
+    lv_obj_t *ht = add_label(hdr, LV_SYMBOL_SETTINGS "  Settings",
+                               C_WHITE, &lv_font_montserrat_16);
+    lv_obj_align(ht, LV_ALIGN_CENTER, 14, 0);
+
+    // ── Scrollable content ──
+    lv_obj_t *cont = lv_obj_create(scr_settings);
+    lv_obj_set_size(cont, SCREEN_W, SCREEN_H - 50);
+    lv_obj_align(cont, LV_ALIGN_TOP_MID, 0, 50);
+    solid_bg(cont, C_BG);
+    lv_obj_set_style_border_width(cont, 0, 0);
+    lv_obj_set_style_radius(cont, 0, 0);
+    lv_obj_set_style_pad_hor(cont, 12, 0);
+    lv_obj_set_style_pad_ver(cont, 12, 0);
+    lv_obj_set_style_pad_row(cont, 10, 0);
+    lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(cont, LV_FLEX_ALIGN_START,
+                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_scroll_dir(cont, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(cont, LV_SCROLLBAR_MODE_ACTIVE);
+    lv_obj_clear_flag(cont, LV_OBJ_FLAG_SCROLL_ELASTIC);
+
+    // ── Clock card ──
+    lv_obj_t *clk = make_card(cont, C_CARD, C_BORDER, 1, 10);
+    lv_obj_set_flex_flow(clk, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(clk, 6, 0);
+
+    add_label(clk, LV_SYMBOL_REFRESH "  DATE & TIME", C_GREY, &lv_font_montserrat_10);
+
+    lbl_settings_time = add_label(clk, "--:--:--", C_BLACK, &lv_font_montserrat_16);
+    lv_obj_set_width(lbl_settings_time, LV_PCT(100));
+    lv_obj_set_style_text_align(lbl_settings_time, LV_TEXT_ALIGN_CENTER, 0);
+
+    lbl_settings_date = add_label(clk, "———", C_GREY, &lv_font_montserrat_14);
+    lv_obj_set_width(lbl_settings_date, LV_PCT(100));
+    lv_obj_set_style_text_align(lbl_settings_date, LV_TEXT_ALIGN_CENTER, 0);
+
+    // ── Set-time hint card ──
+    lv_obj_t *hint = make_card(cont, C_CARD, C_BORDER, 1, 10);
+    lv_obj_set_flex_flow(hint, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(hint, 4, 0);
+    add_label(hint, "Set time via Serial Monitor:", C_GREY, &lv_font_montserrat_10);
+    lv_obj_t *hl = add_label(hint, "SETTIME:YYYY-MM-DDTHH:MM:SS",
+                               C_BLACK, &lv_font_montserrat_10);
+    lv_obj_set_width(hl, LV_PCT(100));
+
+    // ── WiFi card ──
+    lv_obj_t *wc = make_card(cont, C_CARD, C_BORDER, 1, 10);
+    lv_obj_set_flex_flow(wc, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(wc, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    add_label(wc, LV_SYMBOL_WIFI "  WiFi Setup", C_BLACK);
+
+    lv_obj_t *bw = lv_button_create(wc);
+    lv_obj_set_size(bw, 90, 36);
+    solid_bg(bw, C_HDR);
+    lv_obj_set_style_radius(bw, 18, 0);
+    lv_obj_set_style_shadow_width(bw, 0, 0);
+    lv_obj_add_event_cb(bw, [](lv_event_t *) {
+        lv_scr_load_anim(scr_wifi, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+        lv_timer_handler();
+        delay(50);
+        startCaptivePortal();
+    }, LV_EVENT_CLICKED, NULL);
+    lv_obj_center(add_label(bw, "Connect", C_WHITE, &lv_font_montserrat_14));
+}
+
+// ═════════════════════════════════════════════════════════════
 // Welcome / Demo screen
 // ═════════════════════════════════════════════════════════════
 static void create_welcome_screen() {
@@ -584,9 +770,19 @@ static void create_welcome_screen() {
     lv_obj_set_style_radius(hdr, 0, 0);
     lv_obj_set_style_pad_all(hdr, 0, 0);
     lv_obj_clear_flag(hdr, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_t *t = add_label(hdr, LV_SYMBOL_SETTINGS "  AnchorX  Demo",
-                             C_WHITE, &lv_font_montserrat_16);
-    lv_obj_align(t, LV_ALIGN_CENTER, 0, 0);
+
+    lv_obj_t *t = add_label(hdr, "AnchorX  Demo", C_WHITE, &lv_font_montserrat_16);
+    lv_obj_align(t, LV_ALIGN_CENTER, -18, 0);   // shift left to make room for gear
+
+    // Settings gear button (top-right of header)
+    lv_obj_t *btn_gear = lv_button_create(hdr);
+    lv_obj_set_size(btn_gear, 36, 32);
+    lv_obj_align(btn_gear, LV_ALIGN_RIGHT_MID, -8, 0);
+    solid_bg(btn_gear, 0x1976D2);
+    lv_obj_set_style_radius(btn_gear, 8, 0);
+    lv_obj_set_style_shadow_width(btn_gear, 0, 0);
+    lv_obj_add_event_cb(btn_gear, btn_settings_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_center(add_label(btn_gear, LV_SYMBOL_SETTINGS, C_WHITE, &lv_font_montserrat_14));
 
     // Scrollable content area
     lv_obj_t *cont = lv_obj_create(scr_welcome);
@@ -910,11 +1106,30 @@ void setup() {
     lv_indev_set_type(lv_touch, LV_INDEV_TYPE_POINTER);
     lv_indev_set_read_cb(lv_touch, lvgl_touch_cb);
 
+    // Seed ESP32 RTC to a recognisable epoch so the clock shows something
+    // useful even before the user sends SETTIME.  Replace with NTP or
+    // SETTIME:… over Serial to set the real time.
+    {
+        struct tm t = {};
+        t.tm_year = 2026 - 1900; t.tm_mon = 4; t.tm_mday = 1;
+        time_t ep = mktime(&t);
+        struct timeval tv = { ep, 0 };
+        settimeofday(&tv, NULL);
+    }
+
+    create_settings_screen();
     create_welcome_screen();
     create_wifi_screen();
     lv_scr_load(scr_welcome);
 
+    // 1-second clock tick
+    timer_clock = lv_timer_create(clock_timer_cb, 1000, NULL);
+    clock_timer_cb(NULL);   // show time immediately without waiting 1 s
+
     Serial.println("[AnchorX] UI ready");
+    Serial.println("[AnchorX] Serial commands:");
+    Serial.println("  UUID:X,TEMP:X,ATO:ON|OFF");
+    Serial.println("  SETTIME:YYYY-MM-DDTHH:MM:SS");
 }
 
 // ═════════════════════════════════════════════════════════════
@@ -933,46 +1148,33 @@ void loop() {
         webServer.handleClient();
     }
 
-    // ── UART receive & display ──
-    // Expected line format (newline-terminated):
-    //   UUID:XXXXXXXX,TEMP:78.4,ATO:ON
-    // Any field can be omitted; unrecognised fields are ignored.
+    // ── USB Serial (Arduino Serial Monitor) ──
+    // Works in any mode — useful for testing and setting the clock.
+    // Send:  UUID:X,TEMP:X,ATO:ON   or   SETTIME:2026-05-07T15:30:00
+    while (Serial.available()) {
+        char c = (char)Serial.read();
+        if (c == '\n' || c == '\r') {
+            if (usb_idx > 0) {
+                usb_buf[usb_idx] = '\0';
+                usb_idx = 0;
+                Serial.printf("[USB RX] %s\n", usb_buf);
+                parse_data_line(usb_buf);
+            }
+        } else {
+            if (usb_idx < sizeof(usb_buf) - 1)
+                usb_buf[usb_idx++] = c;
+        }
+    }
+
+    // ── Serial2 / hardware UART (active after Skip) ──
     if (uart_mode) {
         while (Serial2.available()) {
             char c = (char)Serial2.read();
             if (c == '\n' || c == '\r') {
-                if (uart_idx == 0) continue;   // skip blank lines
-                uart_buf[uart_idx] = '\0';
-                uart_idx = 0;
-
-                // UUID
-                char *p = strstr(uart_buf, "UUID:");
-                if (p && lbl_uuid) {
-                    char val[48] = "—";
-                    sscanf(p + 5, "%47[^,\r\n]", val);
-                    lv_label_set_text(lbl_uuid, val);
-                }
-                // TEMP
-                p = strstr(uart_buf, "TEMP:");
-                if (p && lbl_temp) {
-                    char raw[16] = "";
-                    sscanf(p + 5, "%15[^,\r\n]", raw);
-                    char fmt[24];
-                    snprintf(fmt, sizeof(fmt), "%s °F", raw);
-                    lv_label_set_text(lbl_temp, fmt);
-                }
-                // ATO
-                p = strstr(uart_buf, "ATO:");
-                if (p && lbl_ato) {
-                    char val[16] = "—";
-                    sscanf(p + 4, "%15[^,\r\n]", val);
-                    // Colour the ATO label green/orange based on state
-                    bool active = (strncmp(val, "ON", 2) == 0 ||
-                                   strncmp(val, "on", 2) == 0);
-                    lv_obj_set_style_text_color(
-                        lbl_ato,
-                        lv_color_hex(active ? C_GREEN : C_ORANGE), 0);
-                    lv_label_set_text(lbl_ato, val);
+                if (uart_idx > 0) {
+                    uart_buf[uart_idx] = '\0';
+                    uart_idx = 0;
+                    parse_data_line(uart_buf);
                 }
             } else {
                 if (uart_idx < sizeof(uart_buf) - 1)
