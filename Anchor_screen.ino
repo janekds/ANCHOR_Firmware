@@ -29,6 +29,8 @@
 #include <Adafruit_ILI9341.h>
 #include <lvgl.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <Preferences.h>
@@ -55,6 +57,11 @@
 // WiFi / captive portal
 #define AP_SSID   "AnchorX-Setup"
 #define DNS_PORT  53
+
+// Firebase Realtime Database
+#define DB_URL    "https://esp32tankcontroller-default-rtdb.firebaseio.com"
+#define DB_SECRET "TnVH0RXPIcmJaXEssviceieY8WUTjR3lqH8NTcfL"
+#define DB_POLL_MS 12000   // refresh interval on device control screen
 
 // UART (connects to main controller after skip)
 // Adjust TX/RX to whichever free GPIOs your board has wired
@@ -125,6 +132,30 @@ static lv_obj_t   *scr_settings      = NULL;
 static lv_obj_t   *lbl_settings_time = NULL;
 static lv_obj_t   *lbl_settings_date = NULL;
 static lv_timer_t *timer_clock        = NULL;
+
+// Devices list screen
+static lv_obj_t *scr_devices        = NULL;
+static lv_obj_t *cont_devices       = NULL;   // scrollable card container
+static lv_obj_t *lbl_devices_status = NULL;   // "Loading…" / error text
+
+// Device control screen
+static lv_obj_t *scr_device_ctrl  = NULL;
+static lv_obj_t *lbl_ctrl_title   = NULL;
+static lv_obj_t *lbl_ctrl_temp    = NULL;
+static lv_obj_t *lbl_ctrl_pump    = NULL;
+static lv_obj_t *lbl_ctrl_ato     = NULL;
+static lv_obj_t *lbl_ctrl_estop   = NULL;
+static lv_obj_t *lbl_ctrl_status  = NULL;   // "Refreshing…" indicator
+static lv_timer_t *timer_poll     = NULL;
+
+// Per-device state
+static char   sanitized_email_str[80]  = "";
+static char   selected_uuid[64]        = "";
+static bool   pending_device_load      = false;  // set by WiFi handler, consumed in loop
+
+// Up to 12 devices shown
+#define MAX_DEVICES 12
+static char device_uuid_store[MAX_DEVICES][64];
 
 // ── WiFi / portal globals ─────────────────────────────────────
 WebServer   webServer(80);
@@ -446,7 +477,8 @@ void handleSetupAnchor() {
             "\"redirectUrl\":\"https://anchorcontrol.web.app\"}");
         delay(500);
         WiFi.softAPdisconnect(true);
-        captivePortalActive = false;
+        captivePortalActive  = false;
+        pending_device_load  = true;   // triggers on_wifi_connected() in loop()
     } else {
         // Keep portal alive — restart AP
         WiFi.mode(WIFI_AP); delay(300);
@@ -655,6 +687,456 @@ static lv_obj_t *make_slider(lv_obj_t *parent,
     lv_obj_set_style_bg_opa(s, LV_OPA_COVER, LV_PART_KNOB);
     if (cb) lv_obj_add_event_cb(s, cb, LV_EVENT_VALUE_CHANGED, NULL);
     return s;
+}
+
+// ═════════════════════════════════════════════════════════════
+// Firebase / device helpers
+// ═════════════════════════════════════════════════════════════
+
+// Build sanitized email key  (@ → _at_   . → _dot_)
+static void sanitize_email(const char *email, char *out, size_t outlen) {
+    strncpy(out, email, outlen - 1);
+    out[outlen - 1] = '\0';
+    // @ → _at_
+    char *p = strchr(out, '@');
+    while (p) {
+        size_t tail = strlen(p + 1);
+        if ((size_t)(p - out) + 4 + tail + 1 >= outlen) break;
+        memmove(p + 4, p + 1, tail + 1);
+        memcpy(p, "_at_", 4);
+        p = strchr(p + 4, '@');
+    }
+    // . → _dot_
+    p = strchr(out, '.');
+    while (p) {
+        size_t tail = strlen(p + 1);
+        if ((size_t)(p - out) + 5 + tail + 1 >= outlen) break;
+        memmove(p + 5, p + 1, tail + 1);
+        memcpy(p, "_dot_", 5);
+        p = strchr(p + 5, '.');
+    }
+}
+
+// Simple key-value extractors for Firebase JSON responses
+static float parse_float_key(const char *json, const char *key) {
+    char search[48];
+    snprintf(search, sizeof(search), "\"%s\":", key);
+    const char *p = strstr(json, search);
+    if (!p) return NAN;
+    p += strlen(search);
+    while (*p == ' ') p++;
+    return (float)atof(p);
+}
+static bool parse_bool_key(const char *json, const char *key) {
+    char search[48];
+    snprintf(search, sizeof(search), "\"%s\":true", key);
+    return strstr(json, search) != NULL;
+}
+static void parse_string_key(const char *json, const char *key,
+                              char *out, size_t outlen) {
+    char search[48];
+    snprintf(search, sizeof(search), "\"%s\":\"", key);
+    const char *p = strstr(json, search);
+    if (!p) { out[0] = '\0'; return; }
+    p += strlen(search);
+    const char *end = strchr(p, '"');
+    if (!end) { out[0] = '\0'; return; }
+    size_t len = (size_t)(end - p);
+    if (len >= outlen) len = outlen - 1;
+    memcpy(out, p, len);
+    out[len] = '\0';
+}
+
+// HTTPS GET → returns body in caller-supplied buffer; returns HTTP code or -1
+static int firebase_get(const char *path, char *body, size_t bodylen) {
+    char url[256];
+    snprintf(url, sizeof(url), "%s%s.json?auth=%s", DB_URL, path, DB_SECRET);
+
+    WiFiClientSecure cli;
+    cli.setInsecure();      // skip certificate verification
+    HTTPClient http;
+    http.setTimeout(8000);
+    if (!http.begin(cli, url)) return -1;
+    int code = http.GET();
+    if (code == 200) {
+        String s = http.getString();
+        strncpy(body, s.c_str(), bodylen - 1);
+        body[bodylen - 1] = '\0';
+    } else {
+        body[0] = '\0';
+    }
+    http.end();
+    return code;
+}
+
+// HTTPS PUT a raw JSON value (e.g. "true", "false", "78.4")
+static int firebase_put(const char *path, const char *value) {
+    char url[256];
+    snprintf(url, sizeof(url), "%s%s.json?auth=%s", DB_URL, path, DB_SECRET);
+    WiFiClientSecure cli;
+    cli.setInsecure();
+    HTTPClient http;
+    http.setTimeout(8000);
+    if (!http.begin(cli, url)) return -1;
+    http.addHeader("Content-Type", "application/json");
+    int code = http.PUT(value);
+    http.end();
+    return code;
+}
+
+// Populate the devices list from a shallow Firebase JSON response
+// {"uuid1":true,"uuid2":true}
+static void populate_device_list(const char *json);   // forward
+
+// Fetch all device UUIDs under sanitized_email and rebuild the list
+static void fetch_device_list() {
+    if (lbl_devices_status)
+        lv_label_set_text(lbl_devices_status, LV_SYMBOL_REFRESH "  Loading devices…");
+
+    // Remove old device cards (keep the status label)
+    if (cont_devices) {
+        uint32_t cnt = lv_obj_get_child_count(cont_devices);
+        for (int32_t i = (int32_t)cnt - 1; i >= 0; i--) {
+            lv_obj_t *child = lv_obj_get_child(cont_devices, i);
+            if (child != lbl_devices_status)
+                lv_obj_delete(child);
+        }
+    }
+    lv_timer_handler();   // repaint "Loading…"
+
+    char path[128], body[2048];
+    snprintf(path, sizeof(path), "/%s", sanitized_email_str);
+    int code = firebase_get(path, body, sizeof(body));
+    if (code == 200) {
+        populate_device_list(body);
+    } else {
+        char msg[64];
+        snprintf(msg, sizeof(msg), LV_SYMBOL_WARNING "  HTTP %d — check credentials", code);
+        if (lbl_devices_status) lv_label_set_text(lbl_devices_status, msg);
+    }
+}
+
+// Fetch system_status for selected_uuid and update ctrl screen
+static void fetch_device_status() {
+    if (selected_uuid[0] == '\0') return;
+    if (lbl_ctrl_status)
+        lv_label_set_text(lbl_ctrl_status, LV_SYMBOL_REFRESH "  Refreshing…");
+    lv_timer_handler();
+
+    char path[160], body[1024];
+    snprintf(path, sizeof(path), "/%s/%s/system_status",
+             sanitized_email_str, selected_uuid);
+    int code = firebase_get(path, body, sizeof(body));
+    if (code != 200) {
+        if (lbl_ctrl_status) lv_label_set_text(lbl_ctrl_status, "Refresh failed");
+        return;
+    }
+
+    // Temperature
+    float temp = parse_float_key(body, "temperature");
+    if (lbl_ctrl_temp) {
+        if (!isnan(temp)) {
+            char t[24]; snprintf(t, sizeof(t), "%.1f \xc2\xb0""F", temp);
+            lv_label_set_text(lbl_ctrl_temp, t);
+        } else {
+            lv_label_set_text(lbl_ctrl_temp, "—");
+        }
+    }
+    // Pump state
+    bool pump = parse_bool_key(body, "pump_state");
+    if (lbl_ctrl_pump) {
+        lv_label_set_text(lbl_ctrl_pump, pump ? "ON" : "OFF");
+        lv_obj_set_style_text_color(lbl_ctrl_pump,
+            lv_color_hex(pump ? C_GREEN : C_GREY), 0);
+    }
+    // ATO empty flag
+    bool ato_empty = parse_bool_key(body, "atoempty");
+    if (lbl_ctrl_ato) {
+        lv_label_set_text(lbl_ctrl_ato, ato_empty ? "EMPTY" : "OK");
+        lv_obj_set_style_text_color(lbl_ctrl_ato,
+            lv_color_hex(ato_empty ? C_ORANGE : C_GREEN), 0);
+    }
+    // E-stop
+    bool estop = parse_bool_key(body, "estop_status");
+    if (lbl_ctrl_estop) {
+        lv_label_set_text(lbl_ctrl_estop, estop ? "ACTIVE" : "Clear");
+        lv_obj_set_style_text_color(lbl_ctrl_estop,
+            lv_color_hex(estop ? 0xB71C1C : C_GREEN), 0);
+    }
+
+    if (lbl_ctrl_status) lv_label_set_text(lbl_ctrl_status, "");
+}
+
+// LVGL timer callback — periodic device status refresh
+static void timer_poll_cb(lv_timer_t *) {
+    if (lv_scr_act() == scr_device_ctrl)
+        fetch_device_status();
+}
+
+// Called when a device card is tapped
+static void device_card_cb(lv_event_t *e) {
+    const char *uuid = (const char *)lv_event_get_user_data(e);
+    strncpy(selected_uuid, uuid, sizeof(selected_uuid) - 1);
+    selected_uuid[sizeof(selected_uuid) - 1] = '\0';
+
+    // Update control screen header
+    if (lbl_ctrl_title) lv_label_set_text(lbl_ctrl_title, uuid);
+    if (lbl_ctrl_temp)  lv_label_set_text(lbl_ctrl_temp,  "—");
+    if (lbl_ctrl_pump)  lv_label_set_text(lbl_ctrl_pump,  "—");
+    if (lbl_ctrl_ato)   lv_label_set_text(lbl_ctrl_ato,   "—");
+    if (lbl_ctrl_estop) lv_label_set_text(lbl_ctrl_estop, "—");
+
+    lv_scr_load_anim(scr_device_ctrl, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+    lv_timer_handler();
+    fetch_device_status();   // immediate first fetch
+}
+
+// Populate device list UI — parses {"uuid1":true,"uuid2":true}
+static void populate_device_list(const char *json) {
+    if (!cont_devices) return;
+    if (!json || strcmp(json, "null") == 0 || json[0] == '\0') {
+        if (lbl_devices_status)
+            lv_label_set_text(lbl_devices_status,
+                              LV_SYMBOL_WARNING "  No devices found for this account");
+        return;
+    }
+    if (lbl_devices_status) lv_label_set_text(lbl_devices_status, "");
+
+    int count = 0;
+    const char *p = json;
+    while (count < MAX_DEVICES && (p = strchr(p, '"')) != NULL) {
+        p++;                          // skip opening quote
+        const char *end = strchr(p, '"');
+        if (!end) break;
+        size_t len = (size_t)(end - p);
+        if (len > 0 && len < 64) {
+            strncpy(device_uuid_store[count], p, len);
+            device_uuid_store[count][len] = '\0';
+
+            // Build a tappable card
+            lv_obj_t *card = make_card(cont_devices, C_CARD, C_BORDER, 1, 10);
+            lv_obj_set_flex_flow(card, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(card, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                                  LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+            lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_set_style_bg_color(card,
+                lv_color_hex(0xE3F2FD), LV_STATE_PRESSED);
+            lv_obj_add_event_cb(card, device_card_cb, LV_EVENT_CLICKED,
+                                device_uuid_store[count]);
+
+            lv_obj_t *name_lbl = add_label(card,
+                device_uuid_store[count], C_BLACK, &lv_font_montserrat_14);
+            lv_obj_set_flex_grow(name_lbl, 1);
+            add_label(card, LV_SYMBOL_RIGHT, C_GREY, &lv_font_montserrat_14);
+            count++;
+        }
+        // Advance past this key's value
+        p = end + 1;
+        const char *comma = strchr(p, ',');
+        if (!comma) break;
+        p = comma + 1;
+    }
+
+    if (count == 0 && lbl_devices_status)
+        lv_label_set_text(lbl_devices_status,
+                          LV_SYMBOL_WARNING "  No devices found for this account");
+}
+
+// Called once WiFi station connection succeeds
+static void on_wifi_connected() {
+    // Derive sanitized email from stored credentials
+    sanitize_email(wifi_email, sanitized_email_str, sizeof(sanitized_email_str));
+    Serial.printf("[Firebase] path prefix: /%s\n", sanitized_email_str);
+
+    // Navigate to devices screen and load the list
+    lv_scr_load_anim(scr_devices, LV_SCR_LOAD_ANIM_MOVE_LEFT, 300, 0, false);
+    lv_timer_handler();
+    delay(50);
+    fetch_device_list();
+}
+
+// ═════════════════════════════════════════════════════════════
+// Device list screen
+// ═════════════════════════════════════════════════════════════
+static void create_devices_screen() {
+    scr_devices = lv_obj_create(NULL);
+    solid_bg(scr_devices, C_BG);
+    lv_obj_clear_flag(scr_devices, LV_OBJ_FLAG_SCROLLABLE);
+
+    // ── Header ──
+    lv_obj_t *hdr = lv_obj_create(scr_devices);
+    lv_obj_set_size(hdr, SCREEN_W, 50);
+    lv_obj_align(hdr, LV_ALIGN_TOP_MID, 0, 0);
+    solid_bg(hdr, C_HDR);
+    lv_obj_set_style_border_width(hdr, 0, 0);
+    lv_obj_set_style_radius(hdr, 0, 0);
+    lv_obj_set_style_pad_all(hdr, 0, 0);
+    lv_obj_clear_flag(hdr, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *ht = add_label(hdr, LV_SYMBOL_LIST "  My Devices",
+                               C_WHITE, &lv_font_montserrat_16);
+    lv_obj_align(ht, LV_ALIGN_CENTER, -14, 0);
+
+    // Refresh button in header
+    lv_obj_t *btn_ref = lv_button_create(hdr);
+    lv_obj_set_size(btn_ref, 36, 32);
+    lv_obj_align(btn_ref, LV_ALIGN_RIGHT_MID, -8, 0);
+    solid_bg(btn_ref, 0x1976D2);
+    lv_obj_set_style_radius(btn_ref, 8, 0);
+    lv_obj_set_style_shadow_width(btn_ref, 0, 0);
+    lv_obj_add_event_cb(btn_ref, [](lv_event_t *) {
+        fetch_device_list();
+    }, LV_EVENT_CLICKED, NULL);
+    lv_obj_center(add_label(btn_ref, LV_SYMBOL_REFRESH, C_WHITE, &lv_font_montserrat_14));
+
+    // ── Scrollable content pane ──
+    cont_devices = lv_obj_create(scr_devices);
+    lv_obj_set_size(cont_devices, SCREEN_W, SCREEN_H - 50);
+    lv_obj_align(cont_devices, LV_ALIGN_TOP_MID, 0, 50);
+    solid_bg(cont_devices, C_BG);
+    lv_obj_set_style_border_width(cont_devices, 0, 0);
+    lv_obj_set_style_radius(cont_devices, 0, 0);
+    lv_obj_set_style_pad_hor(cont_devices, 12, 0);
+    lv_obj_set_style_pad_ver(cont_devices, 12, 0);
+    lv_obj_set_style_pad_row(cont_devices, 10, 0);
+    lv_obj_set_flex_flow(cont_devices, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(cont_devices, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_scroll_dir(cont_devices, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(cont_devices, LV_SCROLLBAR_MODE_ACTIVE);
+    lv_obj_clear_flag(cont_devices, LV_OBJ_FLAG_SCROLL_ELASTIC);
+
+    lbl_devices_status = add_label(cont_devices,
+        LV_SYMBOL_WIFI "  Connect to WiFi first",
+        C_GREY, &lv_font_montserrat_14);
+    lv_obj_set_width(lbl_devices_status, LV_PCT(100));
+    lv_obj_set_style_text_align(lbl_devices_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_pad_top(lbl_devices_status, 40, 0);
+}
+
+// ═════════════════════════════════════════════════════════════
+// Device control screen
+// ═════════════════════════════════════════════════════════════
+static void create_device_ctrl_screen() {
+    scr_device_ctrl = lv_obj_create(NULL);
+    solid_bg(scr_device_ctrl, C_BG);
+    lv_obj_clear_flag(scr_device_ctrl, LV_OBJ_FLAG_SCROLLABLE);
+
+    // ── Header ──
+    lv_obj_t *hdr = lv_obj_create(scr_device_ctrl);
+    lv_obj_set_size(hdr, SCREEN_W, 50);
+    lv_obj_align(hdr, LV_ALIGN_TOP_MID, 0, 0);
+    solid_bg(hdr, C_HDR);
+    lv_obj_set_style_border_width(hdr, 0, 0);
+    lv_obj_set_style_radius(hdr, 0, 0);
+    lv_obj_set_style_pad_all(hdr, 0, 0);
+    lv_obj_clear_flag(hdr, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *back = lv_button_create(hdr);
+    lv_obj_set_size(back, 38, 34);
+    lv_obj_align(back, LV_ALIGN_LEFT_MID, 8, 0);
+    solid_bg(back, 0x1976D2);
+    lv_obj_set_style_radius(back, 8, 0);
+    lv_obj_set_style_shadow_width(back, 0, 0);
+    lv_obj_add_event_cb(back, [](lv_event_t *) {
+        lv_scr_load_anim(scr_devices, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 250, 0, false);
+    }, LV_EVENT_CLICKED, NULL);
+    lv_obj_center(add_label(back, LV_SYMBOL_LEFT, C_WHITE, &lv_font_montserrat_14));
+
+    lbl_ctrl_title = add_label(hdr, "Device", C_WHITE, &lv_font_montserrat_14);
+    lv_obj_align(lbl_ctrl_title, LV_ALIGN_CENTER, 14, 0);
+    lv_obj_set_width(lbl_ctrl_title, SCREEN_W - 100);
+    lv_label_set_long_mode(lbl_ctrl_title, LV_LABEL_LONG_DOT);
+
+    // Refresh button
+    lv_obj_t *btn_ref = lv_button_create(hdr);
+    lv_obj_set_size(btn_ref, 36, 32);
+    lv_obj_align(btn_ref, LV_ALIGN_RIGHT_MID, -8, 0);
+    solid_bg(btn_ref, 0x1976D2);
+    lv_obj_set_style_radius(btn_ref, 8, 0);
+    lv_obj_set_style_shadow_width(btn_ref, 0, 0);
+    lv_obj_add_event_cb(btn_ref, [](lv_event_t *) {
+        fetch_device_status();
+    }, LV_EVENT_CLICKED, NULL);
+    lv_obj_center(add_label(btn_ref, LV_SYMBOL_REFRESH, C_WHITE, &lv_font_montserrat_14));
+
+    // ── Scrollable content ──
+    lv_obj_t *cont = lv_obj_create(scr_device_ctrl);
+    lv_obj_set_size(cont, SCREEN_W, SCREEN_H - 50);
+    lv_obj_align(cont, LV_ALIGN_TOP_MID, 0, 50);
+    solid_bg(cont, C_BG);
+    lv_obj_set_style_border_width(cont, 0, 0);
+    lv_obj_set_style_radius(cont, 0, 0);
+    lv_obj_set_style_pad_hor(cont, 12, 0);
+    lv_obj_set_style_pad_ver(cont, 10, 0);
+    lv_obj_set_style_pad_row(cont, 10, 0);
+    lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(cont, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_scroll_dir(cont, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(cont, LV_SCROLLBAR_MODE_ACTIVE);
+    lv_obj_clear_flag(cont, LV_OBJ_FLAG_SCROLL_ELASTIC);
+
+    // Refresh status label
+    lbl_ctrl_status = add_label(cont, "", C_GREY, &lv_font_montserrat_10);
+
+    auto make_status_row = [&](const char *icon_label, lv_obj_t **val_lbl) {
+        lv_obj_t *card = make_card(cont, C_CARD, C_BORDER, 1, 10);
+        lv_obj_set_flex_flow(card, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(card, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                               LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        add_label(card, icon_label, C_BLACK);
+        *val_lbl = add_label(card, "—", C_BLACK);
+        lv_obj_set_style_text_align(*val_lbl, LV_TEXT_ALIGN_RIGHT, 0);
+    };
+
+    make_status_row(LV_SYMBOL_CHARGE "  Temperature", &lbl_ctrl_temp);
+    make_status_row(LV_SYMBOL_POWER  "  Pump",        &lbl_ctrl_pump);
+    make_status_row(LV_SYMBOL_TINT   "  ATO",         &lbl_ctrl_ato);
+    make_status_row(LV_SYMBOL_WARNING "  E-Stop",     &lbl_ctrl_estop);
+
+    // Pump toggle card
+    {
+        lv_obj_t *card = make_card(cont, C_CARD, C_BORDER, 1, 10);
+        lv_obj_set_flex_flow(card, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(card, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                               LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        add_label(card, "Toggle Pump", C_BLACK);
+
+        lv_obj_t *btn_on = lv_button_create(card);
+        lv_obj_set_size(btn_on, 52, 32);
+        solid_bg(btn_on, C_GREEN);
+        lv_obj_set_style_radius(btn_on, 16, 0);
+        lv_obj_set_style_shadow_width(btn_on, 0, 0);
+        lv_obj_add_event_cb(btn_on, [](lv_event_t *) {
+            char path[160];
+            snprintf(path, sizeof(path), "/%s/%s/system_status/pump_state",
+                     sanitized_email_str, selected_uuid);
+            firebase_put(path, "true");
+            if (lbl_ctrl_pump) {
+                lv_label_set_text(lbl_ctrl_pump, "ON");
+                lv_obj_set_style_text_color(lbl_ctrl_pump, lv_color_hex(C_GREEN), 0);
+            }
+        }, LV_EVENT_CLICKED, NULL);
+        lv_obj_center(add_label(btn_on, "ON", C_WHITE, &lv_font_montserrat_10));
+
+        lv_obj_t *btn_off = lv_button_create(card);
+        lv_obj_set_size(btn_off, 52, 32);
+        solid_bg(btn_off, C_ORANGE);
+        lv_obj_set_style_radius(btn_off, 16, 0);
+        lv_obj_set_style_shadow_width(btn_off, 0, 0);
+        lv_obj_add_event_cb(btn_off, [](lv_event_t *) {
+            char path[160];
+            snprintf(path, sizeof(path), "/%s/%s/system_status/pump_state",
+                     sanitized_email_str, selected_uuid);
+            firebase_put(path, "false");
+            if (lbl_ctrl_pump) {
+                lv_label_set_text(lbl_ctrl_pump, "OFF");
+                lv_obj_set_style_text_color(lbl_ctrl_pump, lv_color_hex(C_GREY), 0);
+            }
+        }, LV_EVENT_CLICKED, NULL);
+        lv_obj_center(add_label(btn_off, "OFF", C_WHITE, &lv_font_montserrat_10));
+    }
 }
 
 // ═════════════════════════════════════════════════════════════
@@ -1117,6 +1599,8 @@ void setup() {
         settimeofday(&tv, NULL);
     }
 
+    create_devices_screen();
+    create_device_ctrl_screen();
     create_settings_screen();
     create_welcome_screen();
     create_wifi_screen();
@@ -1124,6 +1608,10 @@ void setup() {
 
     // 1-second clock tick
     timer_clock = lv_timer_create(clock_timer_cb, 1000, NULL);
+
+    // Periodic device status poll (paused until a device is selected)
+    timer_poll = lv_timer_create(timer_poll_cb, DB_POLL_MS, NULL);
+    lv_timer_pause(timer_poll);
     clock_timer_cb(NULL);   // show time immediately without waiting 1 s
 
     Serial.println("[AnchorX] UI ready");
@@ -1146,6 +1634,20 @@ void loop() {
     if (captivePortalActive) {
         dnsServer.processNextRequest();
         webServer.handleClient();
+    }
+
+    // Transition to devices screen after successful WiFi setup
+    if (pending_device_load) {
+        pending_device_load = false;
+        on_wifi_connected();
+    }
+
+    // Resume / pause device poll timer based on active screen
+    if (timer_poll) {
+        if (lv_scr_act() == scr_device_ctrl)
+            lv_timer_resume(timer_poll);
+        else
+            lv_timer_pause(timer_poll);
     }
 
     // ── USB Serial (Arduino Serial Monitor) ──
