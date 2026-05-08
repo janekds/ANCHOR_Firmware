@@ -30,7 +30,8 @@
 #include <lvgl.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
-#include <HTTPClient.h>
+#include <HTTPClient.h>          // used only for shallow device-list query
+#include <FirebaseClient.h>      // Mobizt: "Firebase Arduino Client Library for ESP8266 and ESP32"
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <Preferences.h>
@@ -167,6 +168,19 @@ char   wifi_password[50] = "";
 char   wifi_email[50]    = "";
 bool   connectedToWifi   = false;
 bool   captivePortalActive = false;
+
+// ── Firebase (matching anchhor pattern) ──────────────────────
+WiFiClientSecure ssl_client;
+using AsyncClient = AsyncClientClass;
+AsyncClient      fb_client(ssl_client);
+LegacyToken      dbSecret(DB_SECRET);
+FirebaseApp      fb_app;
+RealtimeDatabase Database;
+
+enum FbState { FB_DISCONNECTED, FB_CONNECTING, FB_READY };
+FbState  fbState              = FB_DISCONNECTED;
+unsigned long lastFbAttempt   = 0;
+#define FB_RETRY_MS 10000
 
 // ═════════════════════════════════════════════════════════════
 // LVGL flush callback
@@ -747,13 +761,79 @@ static void parse_string_key(const char *json, const char *key,
     out[len] = '\0';
 }
 
-// HTTPS GET → returns body in caller-supplied buffer; returns HTTP code or -1
-static int firebase_get(const char *path, char *body, size_t bodylen) {
-    char url[256];
-    snprintf(url, sizeof(url), "%s%s.json?auth=%s", DB_URL, path, DB_SECRET);
+// ── Forward declarations needed by asyncCB ───────────────────
+static void populate_device_list(const char *json);
+static void update_ctrl_from_json(const char *json);
 
+// ── asyncCB — identical pattern to anchhor ────────────────────
+// Non-static: FirebaseClient requires a plain function pointer.
+void asyncCB(AsyncResult &aResult) {
+    if (aResult.isError()) {
+        Serial.printf("[Firebase] Error [%s]: %s (code %d)\n",
+                      aResult.uid().c_str(),
+                      aResult.error().message().c_str(),
+                      aResult.error().code());
+        if (aResult.uid() == "getSystemStatus" && lbl_ctrl_status)
+            lv_label_set_text(lbl_ctrl_status, "Refresh failed");
+        return;
+    }
+    if (!aResult.available()) return;
+
+    String uid  = aResult.uid();
+    String data = aResult.to<RealtimeDatabaseResult>().to<String>();
+    Serial.printf("[Firebase] [%s] %d bytes\n", uid.c_str(), data.length());
+
+    if (uid == "getSystemStatus") {
+        update_ctrl_from_json(data.c_str());
+    }
+    // setPump write acknowledgements need no UI update
+}
+
+// ── Firebase connection management — same state machine as anchhor ──
+static void manage_firebase() {
+    if (WiFi.status() != WL_CONNECTED) return;
+    unsigned long now = millis();
+
+    switch (fbState) {
+        case FB_DISCONNECTED:
+            if (now - lastFbAttempt >= FB_RETRY_MS) {
+                Serial.println("[Firebase] Connecting...");
+                Serial.printf("[Firebase] URL: %s\n", DB_URL);
+                ssl_client.setInsecure();
+                initializeApp(fb_client, fb_app, getAuth(dbSecret), asyncCB, "authtask");
+                fb_app.getApp<RealtimeDatabase>(Database);
+                Database.url(DB_URL);
+                fbState      = FB_CONNECTING;
+                lastFbAttempt = now;
+            }
+            break;
+        case FB_CONNECTING:
+            if (fb_app.ready()) {
+                fbState = FB_READY;
+                Serial.println("[Firebase] Connected successfully");
+            } else if (now - lastFbAttempt > 12000) {
+                fbState = FB_DISCONNECTED;
+                Serial.println("[Firebase] Connection timed out — will retry");
+            }
+            break;
+        case FB_READY:
+            if (!fb_app.ready()) {
+                fbState = FB_DISCONNECTED;
+                Serial.println("[Firebase] Connection lost");
+            }
+            break;
+    }
+    fb_app.loop();   // pump async operations — must be called every loop iteration
+}
+
+// ── Shallow device-list query (REST — shallow=true has no FirebaseClient API) ──
+// Fired once when navigating to the devices screen.
+static int firebase_get_shallow(const char *emailKey, char *body, size_t bodylen) {
+    char url[320];
+    snprintf(url, sizeof(url), "%s/%s.json?auth=%s&shallow=true",
+             DB_URL, emailKey, DB_SECRET);
     WiFiClientSecure cli;
-    cli.setInsecure();      // skip certificate verification
+    cli.setInsecure();
     HTTPClient http;
     http.setTimeout(8000);
     if (!http.begin(cli, url)) return -1;
@@ -769,26 +849,40 @@ static int firebase_get(const char *path, char *body, size_t bodylen) {
     return code;
 }
 
-// HTTPS PUT a raw JSON value (e.g. "true", "false", "78.4")
-static int firebase_put(const char *path, const char *value) {
-    char url[256];
-    snprintf(url, sizeof(url), "%s%s.json?auth=%s", DB_URL, path, DB_SECRET);
-    WiFiClientSecure cli;
-    cli.setInsecure();
-    HTTPClient http;
-    http.setTimeout(8000);
-    if (!http.begin(cli, url)) return -1;
-    http.addHeader("Content-Type", "application/json");
-    int code = http.PUT(value);
-    http.end();
-    return code;
+// ── Parse system_status JSON and update device control labels ──
+static void update_ctrl_from_json(const char *json) {
+    float temp = parse_float_key(json, "temperature");
+    if (lbl_ctrl_temp) {
+        if (!isnan(temp)) {
+            char t[24]; snprintf(t, sizeof(t), "%.1f \xc2\xb0""F", temp);
+            lv_label_set_text(lbl_ctrl_temp, t);
+        } else {
+            lv_label_set_text(lbl_ctrl_temp, "—");
+        }
+    }
+    bool pump = parse_bool_key(json, "pump_state");
+    if (lbl_ctrl_pump) {
+        lv_label_set_text(lbl_ctrl_pump, pump ? "ON" : "OFF");
+        lv_obj_set_style_text_color(lbl_ctrl_pump,
+            lv_color_hex(pump ? C_GREEN : C_GREY), 0);
+    }
+    bool ato_empty = parse_bool_key(json, "atoempty");
+    if (lbl_ctrl_ato) {
+        lv_label_set_text(lbl_ctrl_ato, ato_empty ? "EMPTY" : "OK");
+        lv_obj_set_style_text_color(lbl_ctrl_ato,
+            lv_color_hex(ato_empty ? C_ORANGE : C_GREEN), 0);
+    }
+    bool estop = parse_bool_key(json, "estop_status");
+    if (lbl_ctrl_estop) {
+        lv_label_set_text(lbl_ctrl_estop, estop ? "ACTIVE" : "Clear");
+        lv_obj_set_style_text_color(lbl_ctrl_estop,
+            lv_color_hex(estop ? 0xB71C1C : C_GREEN), 0);
+    }
+    if (lbl_ctrl_status) lv_label_set_text(lbl_ctrl_status, "");
 }
 
-// Populate the devices list from a shallow Firebase JSON response
-// {"uuid1":true,"uuid2":true}
-static void populate_device_list(const char *json);   // forward
-
-// Fetch all device UUIDs under sanitized_email and rebuild the list
+// Fetch device UUIDs via shallow REST query (firebase_get_shallow),
+// then populate the UI list.
 static void fetch_device_list() {
     if (lbl_devices_status)
         lv_label_set_text(lbl_devices_status, LV_SYMBOL_REFRESH "  Loading devices…");
@@ -804,67 +898,32 @@ static void fetch_device_list() {
     }
     lv_timer_handler();   // repaint "Loading…"
 
-    char path[128], body[2048];
-    snprintf(path, sizeof(path), "/%s", sanitized_email_str);
-    int code = firebase_get(path, body, sizeof(body));
+    static char body[2048];
+    int code = firebase_get_shallow(sanitized_email_str, body, sizeof(body));
     if (code == 200) {
         populate_device_list(body);
     } else {
-        char msg[64];
+        char msg[72];
         snprintf(msg, sizeof(msg), LV_SYMBOL_WARNING "  HTTP %d — check credentials", code);
         if (lbl_devices_status) lv_label_set_text(lbl_devices_status, msg);
     }
 }
 
-// Fetch system_status for selected_uuid and update ctrl screen
+// Async system_status fetch using Database.get() — matching anchhor pattern.
+// Result delivered to asyncCB("getSystemStatus") → update_ctrl_from_json().
 static void fetch_device_status() {
     if (selected_uuid[0] == '\0') return;
-    if (lbl_ctrl_status)
-        lv_label_set_text(lbl_ctrl_status, LV_SYMBOL_REFRESH "  Refreshing…");
-    lv_timer_handler();
-
-    char path[160], body[1024];
-    snprintf(path, sizeof(path), "/%s/%s/system_status",
-             sanitized_email_str, selected_uuid);
-    int code = firebase_get(path, body, sizeof(body));
-    if (code != 200) {
-        if (lbl_ctrl_status) lv_label_set_text(lbl_ctrl_status, "Refresh failed");
+    if (fbState != FB_READY) {
+        if (lbl_ctrl_status)
+            lv_label_set_text(lbl_ctrl_status, LV_SYMBOL_WARNING "  Firebase not ready");
         return;
     }
-
-    // Temperature
-    float temp = parse_float_key(body, "temperature");
-    if (lbl_ctrl_temp) {
-        if (!isnan(temp)) {
-            char t[24]; snprintf(t, sizeof(t), "%.1f \xc2\xb0""F", temp);
-            lv_label_set_text(lbl_ctrl_temp, t);
-        } else {
-            lv_label_set_text(lbl_ctrl_temp, "—");
-        }
-    }
-    // Pump state
-    bool pump = parse_bool_key(body, "pump_state");
-    if (lbl_ctrl_pump) {
-        lv_label_set_text(lbl_ctrl_pump, pump ? "ON" : "OFF");
-        lv_obj_set_style_text_color(lbl_ctrl_pump,
-            lv_color_hex(pump ? C_GREEN : C_GREY), 0);
-    }
-    // ATO empty flag
-    bool ato_empty = parse_bool_key(body, "atoempty");
-    if (lbl_ctrl_ato) {
-        lv_label_set_text(lbl_ctrl_ato, ato_empty ? "EMPTY" : "OK");
-        lv_obj_set_style_text_color(lbl_ctrl_ato,
-            lv_color_hex(ato_empty ? C_ORANGE : C_GREEN), 0);
-    }
-    // E-stop
-    bool estop = parse_bool_key(body, "estop_status");
-    if (lbl_ctrl_estop) {
-        lv_label_set_text(lbl_ctrl_estop, estop ? "ACTIVE" : "Clear");
-        lv_obj_set_style_text_color(lbl_ctrl_estop,
-            lv_color_hex(estop ? 0xB71C1C : C_GREEN), 0);
-    }
-
-    if (lbl_ctrl_status) lv_label_set_text(lbl_ctrl_status, "");
+    if (lbl_ctrl_status)
+        lv_label_set_text(lbl_ctrl_status, LV_SYMBOL_REFRESH "  Refreshing…");
+    char path[160];
+    snprintf(path, sizeof(path), "/%s/%s/system_status",
+             sanitized_email_str, selected_uuid);
+    Database.get(fb_client, path, asyncCB, false, "getSystemStatus");
 }
 
 // LVGL timer callback — periodic device status refresh
@@ -944,11 +1003,15 @@ static void populate_device_list(const char *json) {
 
 // Called once WiFi station connection succeeds
 static void on_wifi_connected() {
-    // Derive sanitized email from stored credentials
     sanitize_email(wifi_email, sanitized_email_str, sizeof(sanitized_email_str));
-    Serial.printf("[Firebase] path prefix: /%s\n", sanitized_email_str);
+    Serial.printf("[Firebase] email key: %s\n", sanitized_email_str);
 
-    // Navigate to devices screen and load the list
+    // Kick Firebase connection — state machine in manage_firebase() will
+    // call initializeApp() exactly as anchhor does.
+    fbState       = FB_DISCONNECTED;
+    lastFbAttempt = 0;   // connect on the very next manage_firebase() call
+
+    // Show device list screen and populate it (shallow REST query — one-shot)
     lv_scr_load_anim(scr_devices, LV_SCR_LOAD_ANIM_MOVE_LEFT, 300, 0, false);
     lv_timer_handler();
     delay(50);
@@ -1109,10 +1172,11 @@ static void create_device_ctrl_screen() {
         lv_obj_set_style_radius(btn_on, 16, 0);
         lv_obj_set_style_shadow_width(btn_on, 0, 0);
         lv_obj_add_event_cb(btn_on, [](lv_event_t *) {
+            if (fbState != FB_READY) return;
             char path[160];
             snprintf(path, sizeof(path), "/%s/%s/system_status/pump_state",
                      sanitized_email_str, selected_uuid);
-            firebase_put(path, "true");
+            Database.set(fb_client, path, true, asyncCB);
             if (lbl_ctrl_pump) {
                 lv_label_set_text(lbl_ctrl_pump, "ON");
                 lv_obj_set_style_text_color(lbl_ctrl_pump, lv_color_hex(C_GREEN), 0);
@@ -1126,10 +1190,11 @@ static void create_device_ctrl_screen() {
         lv_obj_set_style_radius(btn_off, 16, 0);
         lv_obj_set_style_shadow_width(btn_off, 0, 0);
         lv_obj_add_event_cb(btn_off, [](lv_event_t *) {
+            if (fbState != FB_READY) return;
             char path[160];
             snprintf(path, sizeof(path), "/%s/%s/system_status/pump_state",
                      sanitized_email_str, selected_uuid);
-            firebase_put(path, "false");
+            Database.set(fb_client, path, false, asyncCB);
             if (lbl_ctrl_pump) {
                 lv_label_set_text(lbl_ctrl_pump, "OFF");
                 lv_obj_set_style_text_color(lbl_ctrl_pump, lv_color_hex(C_GREY), 0);
@@ -1635,6 +1700,9 @@ void loop() {
         dnsServer.processNextRequest();
         webServer.handleClient();
     }
+
+    // Firebase connection management + async pump — same pattern as anchhor
+    manage_firebase();
 
     // Transition to devices screen after successful WiFi setup
     if (pending_device_load) {
