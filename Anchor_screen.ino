@@ -31,7 +31,12 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>          // used only for shallow device-list query
+
+// Enable required modules before including FirebaseClient
+#define ENABLE_DATABASE
+#define ENABLE_LEGACY_TOKEN
 #include <FirebaseClient.h>      // Mobizt: "Firebase Arduino Client Library for ESP8266 and ESP32"
+using namespace firebase_ns;     // bring LegacyToken, RealtimeDatabase, RealtimeDatabaseResult etc. into scope
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <Preferences.h>
