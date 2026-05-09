@@ -162,7 +162,8 @@ static bool   pending_device_load      = false;  // set by WiFi handler, consume
 // Up to 12 devices shown
 #define MAX_DEVICES 12
 static char      device_uuid_store[MAX_DEVICES][64];
-static lv_obj_t *device_name_lbl[MAX_DEVICES];   // primary label updated once name is fetched
+static lv_obj_t *device_name_lbl[MAX_DEVICES];   // primary label — shows UUID until name loads
+static lv_obj_t *device_uuid_sub[MAX_DEVICES];    // UUID subtext — hidden until name is confirmed
 
 // ── WiFi / portal globals ─────────────────────────────────────
 WebServer   webServer(80);
@@ -792,17 +793,20 @@ void asyncCB(AsyncResult &aResult) {
     if (uid == "getSystemStatus") {
         update_ctrl_from_json(data.c_str());
     } else if (uid.startsWith("getDevName_")) {
-        // uid format: "getDevName_N" where N is the device index
         int idx = atoi(uid.c_str() + 11);
         if (idx >= 0 && idx < MAX_DEVICES && device_name_lbl[idx]) {
-            // Firebase returns a JSON string: "My Aquarium" — strip the outer quotes
+            // Firebase returns a JSON string value: "My Aquarium" — strip outer quotes
             String name = data;
             name.trim();
             if (name.startsWith("\"") && name.endsWith("\"") && name.length() >= 2)
                 name = name.substring(1, name.length() - 1);
-            if (name.length() > 0 && name != "null")
+            if (name.length() > 0 && name != "null") {
+                // Show name as primary, reveal UUID subtext beneath it
                 lv_label_set_text(device_name_lbl[idx], name.c_str());
-            // else keep UUID shown (already set at card creation)
+                if (device_uuid_sub[idx])
+                    lv_obj_clear_flag(device_uuid_sub[idx], LV_OBJ_FLAG_HIDDEN);
+            }
+            // If null/empty: primary label keeps showing the UUID — subtext stays hidden
         }
     }
     // setPump write acknowledgements need no UI update
@@ -980,8 +984,11 @@ static void populate_device_list(const char *json) {
     }
     if (lbl_devices_status) lv_label_set_text(lbl_devices_status, "");
 
-    // Reset name label pointers
-    for (int i = 0; i < MAX_DEVICES; i++) device_name_lbl[i] = NULL;
+    // Reset per-device label pointers
+    for (int i = 0; i < MAX_DEVICES; i++) {
+        device_name_lbl[i] = NULL;
+        device_uuid_sub[i] = NULL;
+    }
 
     int count = 0;
     const char *p = json;
@@ -1018,14 +1025,16 @@ static void populate_device_list(const char *json) {
             lv_obj_set_style_pad_row(col, 2, 0);
             lv_obj_set_flex_grow(col, 1);
 
-            // Name label — starts as UUID, replaced when Firebase responds
+            // Primary label — shows UUID until name arrives from Firebase
             device_name_lbl[count] = add_label(col,
                 device_uuid_store[count], C_BLACK, &lv_font_montserrat_14);
 
-            // UUID subtext (always shown, grey, smaller)
+            // UUID subtext — hidden initially; shown only if a name is found
             lv_obj_t *sub = add_label(col, device_uuid_store[count],
                                       C_GREY, &lv_font_montserrat_10);
             lv_obj_set_style_text_opa(sub, LV_OPA_70, 0);
+            lv_obj_add_flag(sub, LV_OBJ_FLAG_HIDDEN);
+            device_uuid_sub[count] = sub;
 
             add_label(card, LV_SYMBOL_RIGHT, C_GREY, &lv_font_montserrat_14);
 
