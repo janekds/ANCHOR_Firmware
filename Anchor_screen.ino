@@ -100,7 +100,7 @@ static lv_indev_t   *lv_touch = NULL;
 static lv_color_t   *lv_buf   = NULL;   // PSRAM full-frame buffer
 
 // ── UI screens ────────────────────────────────────────────────
-static lv_obj_t *scr_welcome = NULL;
+// scr_welcome removed — replaced by scr_splash
 static lv_obj_t *scr_wifi    = NULL;
 
 // Dynamic labels updated by captive portal
@@ -108,28 +108,12 @@ static lv_obj_t *lbl_wifi_status  = NULL;
 static lv_obj_t *lbl_wifi_network = NULL;
 static lv_obj_t *lbl_wifi_ip      = NULL;
 
-// Dynamic value labels for sliders
-static lv_obj_t *lbl_brightness_val = NULL;
-static lv_obj_t *lbl_flow_val       = NULL;
+// Splash / boot screen
+static lv_obj_t *scr_splash        = NULL;
+static lv_obj_t *lbl_splash_status = NULL;
+static lv_obj_t *btn_splash_wifi   = NULL;
 
-// Handles held so btn_skip_cb can show/hide them
-static lv_obj_t *card_brightness = NULL;   // brightness slider card
-static lv_obj_t *card_flow       = NULL;   // flow slider card
-static lv_obj_t *card_chips      = NULL;   // status chip row
-static lv_obj_t *btn_bar         = NULL;   // bottom button bar
-static lv_obj_t *card_uart       = NULL;   // UART data card (hidden until skip)
-
-// Labels inside the UART data card
-static lv_obj_t *lbl_uuid = NULL;
-static lv_obj_t *lbl_temp = NULL;
-static lv_obj_t *lbl_ato  = NULL;
-
-// UART state
-static bool    uart_mode = false;
-static char    uart_buf[128];
-static uint8_t uart_idx  = 0;
-
-// USB-Serial (Arduino Serial Monitor) receive buffer
+// USB-Serial receive buffer (Serial Monitor testing)
 static char    usb_buf[128];
 static uint8_t usb_idx = 0;
 
@@ -528,7 +512,7 @@ static void btn_wifi_cb(lv_event_t *) {
 }
 
 static void btn_back_cb(lv_event_t *) {
-    lv_scr_load_anim(scr_welcome, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 250, 0, false);
+    lv_scr_load_anim(scr_splash, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 250, 0, false);
 }
 
 // Forward declarations
@@ -541,36 +525,8 @@ void startCaptivePortal();
 //   SETTIME:2026-05-07T15:43:00
 // ─────────────────────────────────────────────────────────────
 static void parse_data_line(const char *line) {
-    const char *p;
-
-    // UUID
-    p = strstr(line, "UUID:");
-    if (p && lbl_uuid) {
-        char val[48] = "—";
-        sscanf(p + 5, "%47[^,\r\n]", val);
-        lv_label_set_text(lbl_uuid, val);
-    }
-    // TEMP
-    p = strstr(line, "TEMP:");
-    if (p && lbl_temp) {
-        char raw[16] = "";
-        sscanf(p + 5, "%15[^,\r\n]", raw);
-        char fmt[28];
-        snprintf(fmt, sizeof(fmt), "%s \xc2\xb0" "F", raw);   // °F in UTF-8
-        lv_label_set_text(lbl_temp, fmt);
-    }
-    // ATO
-    p = strstr(line, "ATO:");
-    if (p && lbl_ato) {
-        char val[16] = "—";
-        sscanf(p + 4, "%15[^,\r\n]", val);
-        bool active = (strncasecmp(val, "ON", 2) == 0);
-        lv_obj_set_style_text_color(lbl_ato,
-            lv_color_hex(active ? C_GREEN : C_ORANGE), 0);
-        lv_label_set_text(lbl_ato, val);
-    }
     // SETTIME:YYYY-MM-DDTHH:MM:SS
-    p = strstr(line, "SETTIME:");
+    const char *p = strstr(line, "SETTIME:");
     if (p) {
         struct tm t = {};
         if (sscanf(p + 8, "%d-%d-%dT%d:%d:%d",
@@ -610,41 +566,6 @@ static void btn_settings_cb(lv_event_t *) {
     lv_scr_load_anim(scr_settings, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
 }
 
-static void btn_skip_cb(lv_event_t *) {
-    if (uart_mode) return; // already activated
-
-    // ── Hide setup-only UI ──
-    lv_obj_add_flag(btn_bar,         LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(card_brightness, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(card_flow,       LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(card_chips,      LV_OBJ_FLAG_HIDDEN);
-
-    // ── Reveal the live-data card ──
-    lv_obj_clear_flag(card_uart, LV_OBJ_FLAG_HIDDEN);
-
-    // ── Start UART ──
-    Serial2.begin(UART_BAUD, SERIAL_8N1, UART_RX, UART_TX);
-    uart_mode  = true;
-    uart_idx   = 0;
-
-    Serial.println("[UART] mode active — listening on Serial2");
-}
-
-// ═════════════════════════════════════════════════════════════
-// Slider callbacks
-// ═════════════════════════════════════════════════════════════
-static void slider_brightness_cb(lv_event_t *e) {
-    char buf[8];
-    snprintf(buf, sizeof(buf), "%ld%%",
-             lv_slider_get_value((lv_obj_t *)lv_event_get_target(e)));
-    lv_label_set_text(lbl_brightness_val, buf);
-}
-static void slider_flow_cb(lv_event_t *e) {
-    char buf[12];
-    snprintf(buf, sizeof(buf), "%ld GPH",
-             lv_slider_get_value((lv_obj_t *)lv_event_get_target(e)));
-    lv_label_set_text(lbl_flow_val, buf);
-}
 
 // ═════════════════════════════════════════════════════════════
 // Style helpers
@@ -1300,7 +1221,7 @@ static void create_settings_screen() {
     lv_obj_set_style_radius(back, 8, 0);
     lv_obj_set_style_shadow_width(back, 0, 0);
     lv_obj_add_event_cb(back, [](lv_event_t *) {
-        lv_scr_load_anim(scr_welcome, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 250, 0, false);
+        lv_scr_load_anim(scr_splash, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 250, 0, false);
     }, LV_EVENT_CLICKED, NULL);
     lv_obj_center(add_label(back, LV_SYMBOL_LEFT, C_WHITE, &lv_font_montserrat_14));
 
@@ -1372,197 +1293,61 @@ static void create_settings_screen() {
 }
 
 // ═════════════════════════════════════════════════════════════
-// Welcome / Demo screen
+// Splash / boot screen  (replaces demo welcome screen)
 // ═════════════════════════════════════════════════════════════
-static void create_welcome_screen() {
-    scr_welcome = lv_obj_create(NULL);
-    solid_bg(scr_welcome, C_BG);
-    lv_obj_clear_flag(scr_welcome, LV_OBJ_FLAG_SCROLLABLE);
+static void create_splash_screen() {
+    scr_splash = lv_obj_create(NULL);
+    solid_bg(scr_splash, C_HDR);                        // deep blue background
+    lv_obj_clear_flag(scr_splash, LV_OBJ_FLAG_SCROLLABLE);
 
-    // Header
-    lv_obj_t *hdr = lv_obj_create(scr_welcome);
-    lv_obj_set_size(hdr, SCREEN_W, 50);
-    lv_obj_align(hdr, LV_ALIGN_TOP_MID, 0, 0);
-    solid_bg(hdr, C_HDR);
-    lv_obj_set_style_border_width(hdr, 0, 0);
-    lv_obj_set_style_radius(hdr, 0, 0);
-    lv_obj_set_style_pad_all(hdr, 0, 0);
-    lv_obj_clear_flag(hdr, LV_OBJ_FLAG_SCROLLABLE);
+    // ── Logo circle ──
+    lv_obj_t *circle = lv_obj_create(scr_splash);
+    lv_obj_set_size(circle, 96, 96);
+    lv_obj_align(circle, LV_ALIGN_CENTER, 0, -52);
+    solid_bg(circle, C_WHITE);
+    lv_obj_set_style_radius(circle, 48, 0);
+    lv_obj_set_style_border_width(circle, 0, 0);
+    lv_obj_set_style_shadow_width(circle, 20, 0);
+    lv_obj_set_style_shadow_color(circle, lv_color_hex(0x0D3A8C), 0);
+    lv_obj_set_style_shadow_opa(circle, LV_OPA_40, 0);
+    lv_obj_clear_flag(circle, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t *t = add_label(hdr, "AnchorX  Demo", C_WHITE, &lv_font_montserrat_16);
-    lv_obj_align(t, LV_ALIGN_CENTER, -18, 0);   // shift left to make room for gear
+    lv_obj_t *icon = add_label(circle, LV_SYMBOL_HOME, C_HDR, &lv_font_montserrat_16);
+    lv_obj_center(icon);
 
-    // Settings gear button (top-right of header)
-    lv_obj_t *btn_gear = lv_button_create(hdr);
-    lv_obj_set_size(btn_gear, 36, 32);
-    lv_obj_align(btn_gear, LV_ALIGN_RIGHT_MID, -8, 0);
-    solid_bg(btn_gear, 0x1976D2);
-    lv_obj_set_style_radius(btn_gear, 8, 0);
-    lv_obj_set_style_shadow_width(btn_gear, 0, 0);
-    lv_obj_add_event_cb(btn_gear, btn_settings_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_center(add_label(btn_gear, LV_SYMBOL_SETTINGS, C_WHITE, &lv_font_montserrat_14));
+    // ── Brand name ──
+    lv_obj_t *brand = add_label(scr_splash, "ANCHOR", C_WHITE, &lv_font_montserrat_16);
+    lv_obj_align(brand, LV_ALIGN_CENTER, 0, 4);
+    lv_obj_set_style_letter_space(brand, 4, 0);
 
-    // Scrollable content area
-    lv_obj_t *cont = lv_obj_create(scr_welcome);
-    lv_obj_set_size(cont, SCREEN_W, SCREEN_H - 50 - 80);
-    lv_obj_align(cont, LV_ALIGN_TOP_MID, 0, 50);
-    solid_bg(cont, C_BG);
-    lv_obj_set_style_border_width(cont, 0, 0);
-    lv_obj_set_style_radius(cont, 0, 0);
-    lv_obj_set_style_pad_hor(cont, 10, 0);
-    lv_obj_set_style_pad_ver(cont, 10, 0);
-    lv_obj_set_style_pad_row(cont, 8, 0);
-    lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(cont, LV_FLEX_ALIGN_START,
-                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_scroll_dir(cont, LV_DIR_VER);
-    lv_obj_set_scrollbar_mode(cont, LV_SCROLLBAR_MODE_ACTIVE);
-    lv_obj_clear_flag(cont, LV_OBJ_FLAG_SCROLL_ELASTIC);
+    // ── Tagline ──
+    lv_obj_t *tag = add_label(scr_splash, "Reef Controller", C_WHITE, &lv_font_montserrat_10);
+    lv_obj_align(tag, LV_ALIGN_CENTER, 0, 24);
+    lv_obj_set_style_text_opa(tag, LV_OPA_60, 0);
 
-    // ── Brightness slider card ──
-    card_brightness = make_card(cont, C_CARD, C_BORDER, 0, 10);
-    {
-        lv_obj_t *card = card_brightness;
-        lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
-        lv_obj_set_style_pad_row(card, 6, 0);
+    // ── Status text (updated during boot) ──
+    lbl_splash_status = add_label(scr_splash, "", C_WHITE, &lv_font_montserrat_10);
+    lv_obj_align(lbl_splash_status, LV_ALIGN_CENTER, 0, 80);
+    lv_obj_set_style_text_opa(lbl_splash_status, LV_OPA_70, 0);
+    lv_obj_set_width(lbl_splash_status, SCREEN_W - 32);
+    lv_obj_set_style_text_align(lbl_splash_status, LV_TEXT_ALIGN_CENTER, 0);
 
-        lv_obj_t *rh = make_row(card, C_CARD);
-        add_label(rh, LV_SYMBOL_IMAGE "  Brightness", C_BLACK);
-        lbl_brightness_val = add_label(rh, "75%", C_BLACK);
-
-        make_slider(card, C_BORDER, C_ACCENT, 0, 100, 75, slider_brightness_cb);
-    }
-
-    // ── Flow rate slider card ──
-    card_flow = make_card(cont, C_CARD, C_BORDER, 0, 10);
-    {
-        lv_obj_t *card = card_flow;
-        lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
-        lv_obj_set_style_pad_row(card, 6, 0);
-
-        lv_obj_t *rh = make_row(card, C_CARD);
-        add_label(rh, LV_SYMBOL_LOOP "  Flow Rate", C_BLACK);
-        lbl_flow_val = add_label(rh, "200 GPH", C_BLACK);
-
-        make_slider(card, C_BORDER, C_ACCENT, 0, 500, 200, slider_flow_cb);
-    }
-
-    // ── UART connected data card (hidden until Skip is pressed) ──
-    card_uart = make_card(cont, C_CARD, C_BORDER, 1, 10);
-    lv_obj_add_flag(card_uart, LV_OBJ_FLAG_HIDDEN);
-    {
-        lv_obj_t *card = card_uart;
-        lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
-        lv_obj_set_style_pad_row(card, 10, 0);
-
-        // UUID row
-        lv_obj_t *r1 = make_row(card, C_CARD);
-        add_label(r1, LV_SYMBOL_SETTINGS "  Device UUID", C_GREY, &lv_font_montserrat_10);
-        lbl_uuid = add_label(r1, "—", C_BLACK, &lv_font_montserrat_10);
-
-        // Divider
-        lv_obj_t *div = lv_obj_create(card);
-        lv_obj_set_size(div, LV_PCT(100), 1);
-        solid_bg(div, C_BORDER);
-        lv_obj_set_style_border_width(div, 0, 0);
-
-        // Temperature row
-        lv_obj_t *r2 = make_row(card, C_CARD);
-        add_label(r2, LV_SYMBOL_CHARGE "  Temperature", C_BLACK);
-        lbl_temp = add_label(r2, "— °F", C_BLACK);
-
-        // ATO status row
-        lv_obj_t *r3 = make_row(card, C_CARD);
-        add_label(r3, LV_SYMBOL_TINT "  ATO Status", C_BLACK);
-        lbl_ato = add_label(r3, "—", C_BLACK);
-    }
-
-    // ── Status chips ──
-    {
-        card_chips = lv_obj_create(cont);
-        lv_obj_t *row = card_chips;
-        lv_obj_set_size(row, LV_PCT(100), LV_SIZE_CONTENT);
-        solid_bg(row, C_BG);
-        lv_obj_set_style_border_width(row, 0, 0);
-        lv_obj_set_style_pad_all(row, 4, 0);
-        lv_obj_set_style_pad_column(row, 6, 0);
-        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN,
-                               LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-        const char *names[]  = { LV_SYMBOL_WARNING " Lights",
-                                  LV_SYMBOL_POWER   " Pump",
-                                  LV_SYMBOL_REFRESH " ATO" };
-        uint32_t    colors[] = { 0x1B5E20, 0x0D47A1, 0xE65100 };
-        for (int i = 0; i < 3; i++) {
-            lv_obj_t *chip = lv_button_create(row);
-            lv_obj_set_size(chip, 68, 30);
-            solid_bg(chip, colors[i]);
-            lv_obj_set_style_radius(chip, 15, 0);
-            lv_obj_set_style_shadow_width(chip, 0, 0);
-            lv_obj_t *cl = add_label(chip, names[i], C_WHITE, &lv_font_montserrat_10);
-            lv_obj_center(cl);
-        }
-    }
-
-    // ── Sensor readout card ──
-    {
-        lv_obj_t *card = make_card(cont, C_CARD, C_BORDER, 1, 10);
-        lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
-        lv_obj_set_style_pad_row(card, 4, 0);
-
-        const char *rows[] = {
-            LV_SYMBOL_CHARGE    "  Temperature:  78.4 F",
-            LV_SYMBOL_VOLUME_MAX " Salinity:      35.0 ppt",
-            LV_SYMBOL_TINT      "  pH:           8.20",
-            LV_SYMBOL_EYE_OPEN  "  Nitrate:      5 ppm",
-        };
-        for (int i = 0; i < 4; i++) {
-            lv_obj_t *rw = make_row(card, C_CARD);
-            add_label(rw, rows[i], C_BLACK, &lv_font_montserrat_14);
-        }
-    }
-
-    // ── Bottom bar ──
-    btn_bar = lv_obj_create(scr_welcome);
-    lv_obj_t *bar = btn_bar;
-    lv_obj_set_size(bar, SCREEN_W, 80);
-    lv_obj_align(bar, LV_ALIGN_BOTTOM_MID, 0, 0);
-    solid_bg(bar, C_WHITE);
-    lv_obj_set_style_border_color(bar, lv_color_hex(C_BORDER), 0);
-    lv_obj_set_style_border_width(bar, 1, 0);
-    lv_obj_set_style_border_side(bar, LV_BORDER_SIDE_TOP, 0);
-    lv_obj_set_style_radius(bar, 0, 0);
-    lv_obj_set_style_pad_all(bar, 14, 0);
-    lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_flex_flow(bar, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(bar, LV_FLEX_ALIGN_SPACE_BETWEEN,
-                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-    // Skip button
-    lv_obj_t *btn_skip = lv_button_create(bar);
-    lv_obj_set_size(btn_skip, 88, 48);
-    solid_bg(btn_skip, C_BORDER);
-    lv_obj_set_style_radius(btn_skip, 24, 0);
-    lv_obj_set_style_shadow_width(btn_skip, 0, 0);
-    lv_obj_add_event_cb(btn_skip, btn_skip_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *ls = add_label(btn_skip, "Skip", C_BLACK, &lv_font_montserrat_14);
-    lv_obj_center(ls);
-
-    // Connect WiFi button
-    lv_obj_t *btn_wifi = lv_button_create(bar);
-    lv_obj_set_size(btn_wifi, 122, 48);
-    solid_bg(btn_wifi, C_HDR);
-    lv_obj_set_style_bg_color(btn_wifi, lv_color_hex(0x1976D2), LV_STATE_PRESSED);
-    lv_obj_set_style_radius(btn_wifi, 24, 0);
-    lv_obj_set_style_shadow_width(btn_wifi, 12, 0);
-    lv_obj_set_style_shadow_color(btn_wifi, lv_color_hex(0x0D47A1), 0);
-    lv_obj_set_style_shadow_opa(btn_wifi, LV_OPA_50, 0);
-    lv_obj_add_event_cb(btn_wifi, btn_wifi_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *lw = add_label(btn_wifi, LV_SYMBOL_WIFI " Connect WiFi",
-                               C_WHITE, &lv_font_montserrat_14);
-    lv_obj_center(lw);
+    // ── Connect WiFi button (hidden until needed) ──
+    btn_splash_wifi = lv_button_create(scr_splash);
+    lv_obj_set_size(btn_splash_wifi, 170, 46);
+    lv_obj_align(btn_splash_wifi, LV_ALIGN_CENTER, 0, 108);
+    solid_bg(btn_splash_wifi, C_WHITE);
+    lv_obj_set_style_radius(btn_splash_wifi, 23, 0);
+    lv_obj_set_style_shadow_width(btn_splash_wifi, 0, 0);
+    lv_obj_add_flag(btn_splash_wifi, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(btn_splash_wifi, [](lv_event_t *) {
+        lv_scr_load_anim(scr_wifi, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+        lv_timer_handler();
+        delay(50);
+        startCaptivePortal();
+    }, LV_EVENT_CLICKED, NULL);
+    lv_obj_center(add_label(btn_splash_wifi,
+        LV_SYMBOL_WIFI "  Connect to WiFi", C_HDR, &lv_font_montserrat_14));
 }
 
 // ═════════════════════════════════════════════════════════════
@@ -1738,9 +1523,13 @@ void setup() {
     create_devices_screen();
     create_device_ctrl_screen();
     create_settings_screen();
-    create_welcome_screen();
+    create_splash_screen();
     create_wifi_screen();
-    lv_scr_load(scr_welcome);
+
+    // Show splash and render one frame so the logo is visible immediately
+    lv_scr_load(scr_splash);
+    lv_timer_handler();
+    delay(80);
 
     // 1-second clock tick
     timer_clock = lv_timer_create(clock_timer_cb, 1000, NULL);
@@ -1748,11 +1537,38 @@ void setup() {
     // Periodic device status poll (paused until a device is selected)
     timer_poll = lv_timer_create(timer_poll_cb, DB_POLL_MS, NULL);
     lv_timer_pause(timer_poll);
-    clock_timer_cb(NULL);   // show time immediately without waiting 1 s
+    clock_timer_cb(NULL);
+
+    Serial.println("[AnchorX] Checking for saved WiFi credentials...");
+
+    // ── Boot WiFi check (mirrors anchhor pattern) ──────────────────
+    // pref is already open ("anchor" namespace from earlier in setup)
+    bool hasCreds = pref.isKey("ssid") && pref.isKey("password");
+
+    if (hasCreds) {
+
+        lv_label_set_text(lbl_splash_status, "Connecting to WiFi...");
+        lv_timer_handler();
+        delay(40);
+
+        connectToWiFi(wifi_ssid, wifi_password);
+
+        if (connectedToWifi) {
+            Serial.println("[AnchorX] Auto-connected with saved credentials");
+            on_wifi_connected();           // transitions to devices screen
+        } else {
+            Serial.println("[AnchorX] Saved credentials failed — showing connect button");
+            lv_label_set_text(lbl_splash_status, "WiFi unavailable — tap below to reconnect");
+            lv_obj_clear_flag(btn_splash_wifi, LV_OBJ_FLAG_HIDDEN);
+        }
+    } else {
+        Serial.println("[AnchorX] No saved credentials");
+        lv_label_set_text(lbl_splash_status, "Tap below to connect to WiFi");
+        lv_obj_clear_flag(btn_splash_wifi, LV_OBJ_FLAG_HIDDEN);
+    }
 
     Serial.println("[AnchorX] UI ready");
     Serial.println("[AnchorX] Serial commands:");
-    Serial.println("  UUID:X,TEMP:X,ATO:ON|OFF");
     Serial.println("  SETTIME:YYYY-MM-DDTHH:MM:SS");
 }
 
@@ -1807,22 +1623,7 @@ void loop() {
         }
     }
 
-    // ── Serial2 / hardware UART (active after Skip) ──
-    if (uart_mode) {
-        while (Serial2.available()) {
-            char c = (char)Serial2.read();
-            if (c == '\n' || c == '\r') {
-                if (uart_idx > 0) {
-                    uart_buf[uart_idx] = '\0';
-                    uart_idx = 0;
-                    parse_data_line(uart_buf);
-                }
-            } else {
-                if (uart_idx < sizeof(uart_buf) - 1)
-                    uart_buf[uart_idx++] = c;
-            }
-        }
-    }
+
 
     delay(5);
 }
