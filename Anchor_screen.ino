@@ -161,7 +161,8 @@ static bool   pending_device_load      = false;  // set by WiFi handler, consume
 
 // Up to 12 devices shown
 #define MAX_DEVICES 12
-static char device_uuid_store[MAX_DEVICES][64];
+static char      device_uuid_store[MAX_DEVICES][64];
+static lv_obj_t *device_name_lbl[MAX_DEVICES];   // primary label updated once name is fetched
 
 // ── WiFi / portal globals ─────────────────────────────────────
 WebServer   webServer(80);
@@ -790,6 +791,19 @@ void asyncCB(AsyncResult &aResult) {
 
     if (uid == "getSystemStatus") {
         update_ctrl_from_json(data.c_str());
+    } else if (uid.startsWith("getDevName_")) {
+        // uid format: "getDevName_N" where N is the device index
+        int idx = atoi(uid.c_str() + 11);
+        if (idx >= 0 && idx < MAX_DEVICES && device_name_lbl[idx]) {
+            // Firebase returns a JSON string: "My Aquarium" — strip the outer quotes
+            String name = data;
+            name.trim();
+            if (name.startsWith("\"") && name.endsWith("\"") && name.length() >= 2)
+                name = name.substring(1, name.length() - 1);
+            if (name.length() > 0 && name != "null")
+                lv_label_set_text(device_name_lbl[idx], name.c_str());
+            // else keep UUID shown (already set at card creation)
+        }
     }
     // setPump write acknowledgements need no UI update
 }
@@ -966,10 +980,13 @@ static void populate_device_list(const char *json) {
     }
     if (lbl_devices_status) lv_label_set_text(lbl_devices_status, "");
 
+    // Reset name label pointers
+    for (int i = 0; i < MAX_DEVICES; i++) device_name_lbl[i] = NULL;
+
     int count = 0;
     const char *p = json;
     while (count < MAX_DEVICES && (p = strchr(p, '"')) != NULL) {
-        p++;                          // skip opening quote
+        p++;
         const char *end = strchr(p, '"');
         if (!end) break;
         size_t len = (size_t)(end - p);
@@ -977,24 +994,52 @@ static void populate_device_list(const char *json) {
             strncpy(device_uuid_store[count], p, len);
             device_uuid_store[count][len] = '\0';
 
-            // Build a tappable card
+            // ── Card: [text column (name + uuid)]  [›] ──
             lv_obj_t *card = make_card(cont_devices, C_CARD, C_BORDER, 1, 10);
+            lv_obj_set_style_pad_ver(card, 10, 0);
             lv_obj_set_flex_flow(card, LV_FLEX_FLOW_ROW);
             lv_obj_set_flex_align(card, LV_FLEX_ALIGN_SPACE_BETWEEN,
                                   LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
             lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
-            lv_obj_set_style_bg_color(card,
-                lv_color_hex(0xE3F2FD), LV_STATE_PRESSED);
+            lv_obj_set_style_bg_color(card, lv_color_hex(0xE3F2FD), LV_STATE_PRESSED);
             lv_obj_add_event_cb(card, device_card_cb, LV_EVENT_CLICKED,
                                 device_uuid_store[count]);
 
-            lv_obj_t *name_lbl = add_label(card,
+            // Left column: name (will update async) + UUID subtext
+            lv_obj_t *col = lv_obj_create(card);
+            lv_obj_set_size(col, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+            solid_bg(col, C_CARD);
+            lv_obj_set_style_border_width(col, 0, 0);
+            lv_obj_set_style_pad_all(col, 0, 0);
+            lv_obj_clear_flag(col, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+            lv_obj_set_flex_align(col, LV_FLEX_ALIGN_CENTER,
+                                  LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+            lv_obj_set_style_pad_row(col, 2, 0);
+            lv_obj_set_flex_grow(col, 1);
+
+            // Name label — starts as UUID, replaced when Firebase responds
+            device_name_lbl[count] = add_label(col,
                 device_uuid_store[count], C_BLACK, &lv_font_montserrat_14);
-            lv_obj_set_flex_grow(name_lbl, 1);
+
+            // UUID subtext (always shown, grey, smaller)
+            lv_obj_t *sub = add_label(col, device_uuid_store[count],
+                                      C_GREY, &lv_font_montserrat_10);
+            lv_obj_set_style_text_opa(sub, LV_OPA_70, 0);
+
             add_label(card, LV_SYMBOL_RIGHT, C_GREY, &lv_font_montserrat_14);
+
+            // Queue async name fetch from {email}/{uuid}/settings/name
+            if (fbState == FB_READY) {
+                char namePath[160], uid[24];
+                snprintf(namePath, sizeof(namePath), "/%s/%s/settings/name",
+                         sanitized_email_str, device_uuid_store[count]);
+                snprintf(uid, sizeof(uid), "getDevName_%d", count);
+                Database.get(fb_client, namePath, asyncCB, false, uid);
+            }
+
             count++;
         }
-        // Advance past this key's value
         p = end + 1;
         const char *comma = strchr(p, ',');
         if (!comma) break;
@@ -1043,9 +1088,21 @@ static void create_devices_screen() {
 
     lv_obj_t *ht = add_label(hdr, LV_SYMBOL_LIST "  My Devices",
                                C_WHITE, &lv_font_montserrat_16);
-    lv_obj_align(ht, LV_ALIGN_CENTER, -14, 0);
+    lv_obj_align(ht, LV_ALIGN_CENTER, 0, 0);
 
-    // Refresh button in header
+    // Settings button (left side of header)
+    lv_obj_t *btn_set = lv_button_create(hdr);
+    lv_obj_set_size(btn_set, 36, 32);
+    lv_obj_align(btn_set, LV_ALIGN_LEFT_MID, 8, 0);
+    solid_bg(btn_set, 0x1976D2);
+    lv_obj_set_style_radius(btn_set, 8, 0);
+    lv_obj_set_style_shadow_width(btn_set, 0, 0);
+    lv_obj_add_event_cb(btn_set, [](lv_event_t *) {
+        lv_scr_load_anim(scr_settings, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+    }, LV_EVENT_CLICKED, NULL);
+    lv_obj_center(add_label(btn_set, LV_SYMBOL_SETTINGS, C_WHITE, &lv_font_montserrat_14));
+
+    // Refresh button (right side of header)
     lv_obj_t *btn_ref = lv_button_create(hdr);
     lv_obj_set_size(btn_ref, 36, 32);
     lv_obj_align(btn_ref, LV_ALIGN_RIGHT_MID, -8, 0);
